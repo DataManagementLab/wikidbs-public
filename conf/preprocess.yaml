@@ -1,0 +1,29 @@
+defaults:
+  - _self_
+  - db: db_config
+
+wikidata_dump: ??? # path to latest-all.json.gz, link in README
+
+limit: null # int or null, limit the number of items to process, wikidata has around 100 million items
+
+checkpoint_iterations: ??? # number of iterations/items after which to save a checkpoint of the profiling dict, recommendation is > 1 million
+
+language_code: "en"
+
+hydra:
+  job: 
+    name: wikidata_preprocessing
+  run:
+    dir: ./outputs/${hydra.job.name}/${now:%Y-%m-%d_%H-%M-%S}
+  help:
+    template: |-
+      Pre-processes the wikidata dump and loads it into MongoDB. Requires a running MongoDB instance (see README) and a configured db_config.yaml.
+
+      == Config ==
+      This is the config generated for this run. 
+      You need to replace all ??? values with your parameters.
+      Edit the config in conf/preprocess.yaml or override parameters from the commandline, for example:
+      python preprocessing_wikidata_dump.py data.wikidata_dump_file={your_file}
+      -------
+      $CONFIG
+      -------

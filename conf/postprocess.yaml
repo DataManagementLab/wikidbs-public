@@ -1,0 +1,8 @@
+
+output_folder: ??? # output folder to save renamed dbs in
+
+input_folder:  ???# folder with dbs to rename
+
+limit: ???  # int or null, limit the number databases that should be processed
+
+processes: 2 # int or null, number of processes for parallelization

@@ -1,0 +1,7 @@
+database: wikidata_processed
+
+config:
+  username: 
+  password: 
+  port: 27017
+  host: 127.0.0.1

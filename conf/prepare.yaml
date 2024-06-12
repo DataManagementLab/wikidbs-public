@@ -1,0 +1,10 @@
+# separate files are needed for parallelized crawling
+
+wikidata_jsonl: ???  # path to jsonl profiling dict
+
+output_folder: ??? # path to save the resulting jsonl files
+
+num_separate_files: ??? # int, how many separate jsonl files should be created
+
+total_topics_limit: ??? # how many potential database topics should be processed
+  

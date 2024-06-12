@@ -1,0 +1,34 @@
+defaults:
+  - _self_
+  - db: db_config
+
+profiling_dict: ??? # filepath to json profiling dict from preprocessing
+
+converted_dict_name: ??? # filename of the output file
+
+get_nl_labels: True # boolean, needs db connection to fetch the natural language labels for predicates and objects
+
+label_names_min_num_rows: ??? # int or null, get label names only for the topics with at least label_names_min_num_rows rows
+
+limit: ??? # null or int
+
+hydra:
+  job: 
+    name: wikidata_convert
+  run:
+    dir: ./outputs/${hydra.job.name}/${now:%Y-%m-%d_%H-%M-%S}
+  help:
+    template: |-
+      Convert the profiling dict from preprocessing stage into jsonlines format, each line is a possible table. 
+
+      This will take a while if get_nl_labels is set to true, since label names are fetched from the databases.
+      A limit can be set to fetch label names only for tables with at least x rows.
+
+      == Config ==
+      This is the config generated for this run. 
+      You need to replace all ??? values with your parameters.
+      Edit the config in conf/preprocess.yaml or override parameters from the commandline, for example:
+      python ./scripts/convert_jsonlines.py.py data.profiling_dict={your_file}
+      -------
+      $CONFIG
+      -------

@@ -6,12 +6,14 @@ This repository contains code to create relational databases based on Wikidata (
 
 ## Part 1: Setup MongoDB via Docker
 
-1. Make sure that Doker is installed on your system, otherwise install it
+The databases will be created based on the Wikidata JSON export. For efficient querying the data will be stored in MongoDB.
+
+1. Make sure that Docker is installed on your system (otherwise install it)
 `docker --version`
 2. Download the MongoDB docker image from DockerHub
-`sudo docker pull mongo`
+`docker pull mongo`
 3. Ensure that the image has been installed
-`sudo docker images`
+`docker images`
 4. Create a `mongo-data` and a `mongo-config` folder to save the data and configuration files in
 5. Adapt the `docker-compose.yaml` file found in the `mongodb` folder of this repository to your system (container name, paths to folders, user id)
 6. Start MongoDB by running
@@ -38,7 +40,7 @@ We provide two options, the first one (3a) is to import our pre-processed MongoD
 
 ### 3a: Load our pre-processed MongoDB export
 
-1. Copy the wikidata_mongodb_archive.gz file from our downloads to the mongo-data folder that you crated in Part 1.
+1. Copy the wikidata_mongodb_archive.gz file from our downloads to the mongo-data folder that you created in step 1.4.
 
 2. Log into the MongoDB Shell by executing:
 
@@ -75,7 +77,7 @@ https://www.wikidata.org/wiki/Wikidata:Database_download
 
 
 2. Preprocess the wikidata dump
-To load the dump into the MongoDB, adapt the settings in 'conf/preprocess.yaml' and then run the following script:
+To load the dump into MongoDB, adapt the settings in 'conf/preprocess.yaml' and then run the following script:
 
 ```
 python ./scripts/preprocessing/preprocess_dump.py

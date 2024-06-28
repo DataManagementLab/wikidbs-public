@@ -1,0 +1,16 @@
+version: "2.2"
+services:
+    mongo:
+        image: mongo 
+        container_name: <your-container-name>
+        network_mode: "host"
+        volumes:
+            - <your-path-to-mongo-data>:/data/db
+            - <your-path-tomongo-config>:/data/configdb
+        ulimits:
+            memlock: -1
+        entrypoint: mongod --wiredTigerCacheSizeGB 125
+        restart: always
+
+
+

@@ -75,6 +75,10 @@ def handle_line(
         for table in database_to_process.tables:
             table.table_df.columns = [ast.literal_eval(col) for col in table.table_df.columns]
 
+        # load renaming info
+        with open(db_folder / "llm_renaming_cased.json", "r", encoding="utf-8") as file:
+            renaming_info = json.load(file)
+
         # create schema information
         final_tables = []
         col_names_first_col = {}
@@ -107,21 +111,22 @@ def handle_line(
         Path(db_folder / "tables_with_item_ids").mkdir()
 
         for table_idx, table in enumerate(database_to_process.tables):
-            # handle foreign keys
-
+            # handle foreign keys (need to update fk names after paraphrasing)
             foreign_keys = []
             for fk in table.foreign_keys:
-                fk_col = fk.column_name
+                orig_fk_col = fk.column_name
+                fk_col = renaming_info[table.table_name]["columns"][orig_fk_col]
 
-                fk_reference_table = fk.reference_table_name
+                orig_fk_reference_table = fk.reference_table_name
+                fk_reference_table = renaming_info[orig_fk_reference_table][orig_fk_reference_table]
+
                 reference_col = col_names_first_col[fk_reference_table]
+
                 schema_fk = wikidbs.schema.ForeignKey(column=fk_col,
                                                     reference_column=reference_col,
                                                     reference_table=fk_reference_table)
                 foreign_keys.append(schema_fk)
-
-
-            #print(f"Foreign keys are: {foreign_keys}")
+                
             schema_table = wikidbs.schema.Table(table_name=table.llm_table_name,
                                                 file_name=str(table.llm_table_name) + ".csv",
                                                 columns=columns_per_table[table.llm_table_name],

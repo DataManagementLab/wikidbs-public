@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import json
 from tqdm import tqdm
-import numpy as np
+import multiprocessing.dummy
 
 from sentence_transformers import SentenceTransformer
 
@@ -89,7 +89,9 @@ def start_db_creation(cfg: DictConfig):
                 db_path.mkdir(parents=True)
 
                 # rename
-                rename(cfg=cfg, database=database, responses_dir=db_path)
+                dummy_semaphore = multiprocessing.dummy.Semaphore()
+                dummy_history =  {"rpm_budget": None, "tpm_budget": None, "last_update": None}
+                rename(cfg=cfg, database=database, responses_dir=db_path, history_semaphore=dummy_semaphore, history=dummy_history)
 
                 # keep original table names if LLM created duplicates
                 llm_table_names = []
@@ -116,8 +118,9 @@ def start_db_creation(cfg: DictConfig):
 
                     new_col_names = []
                     for col in table.llm_renamed_df.columns:
-                        new_col_name = postprocess_name(col, mode=mode)
-                        new_col_names.append(new_col_name)
+                        # col is a triple (col_name, property_id, 'datatype')
+                        new_col_name = postprocess_name(col[0], mode=mode)
+                        new_col_names.append((new_col_name, col[1], col[2]))
                     table.llm_renamed_df.columns = new_col_names
 
                     # save renaming info cased
@@ -169,21 +172,21 @@ def start_db_creation(cfg: DictConfig):
                 Path(db_path / "tables_with_item_ids").mkdir()
 
                 for table_idx, table in enumerate(database.tables):
-                    # handle foreign keys
-
+                    # handle foreign keys (need to update fk names after paraphrasing)
                     foreign_keys = []
                     for fk in table.foreign_keys:
-                        fk_col = fk.column_name
+                        orig_fk_col = fk.column_name
+                        fk_col = renaming_info[table.table_name]["columns"][orig_fk_col]
 
-                        fk_reference_table = fk.reference_table_name
+                        orig_fk_reference_table = fk.reference_table_name
+                        fk_reference_table = renaming_info[orig_fk_reference_table][orig_fk_reference_table]
+
                         reference_col = col_names_first_col[fk_reference_table]
+
                         schema_fk = wikidbs.schema.ForeignKey(column=fk_col,
                                                             reference_column=reference_col,
                                                             reference_table=fk_reference_table)
                         foreign_keys.append(schema_fk)
-
-
-                    #print(f"Foreign keys are: {foreign_keys}")
                     schema_table = wikidbs.schema.Table(table_name=table.llm_table_name,
                                                         file_name=str(table.llm_table_name) + ".csv",
                                                         columns=columns_per_table[table.llm_table_name],
@@ -198,10 +201,8 @@ def start_db_creation(cfg: DictConfig):
                     table_df_save.to_csv(db_path / "tables" / filename, index=False)
 
                     ## prepare final df with qids
-                    orig_table = database.tables[table_idx]
-                    table_df_save = orig_table.table_df.map(lambda x: (x[0], x[1]) if isinstance(x, list) else x)
-                    table_df_save.columns = table.columns #cols_with_pid
-
+                    table_df_save =  table.llm_renamed_df.map(lambda x: (x[0], x[1]) if isinstance(x, list) else x)
+                    table_df_save.columns = table_df_save.columns.map(lambda x: x[0] if isinstance(x, tuple) else x)
                     table_df_save.to_csv(db_path / "tables_with_item_ids" / filename, index=False)
 
                 start_table = database.tables[0]
@@ -225,7 +226,7 @@ def start_db_creation(cfg: DictConfig):
 
 
                 # visualize the schema
-                create_schema_diagram(database=database, save_path=db_path, show_diagram=False)
+                create_schema_diagram(tables=final_tables, save_path=db_path, show_diagram=False)
 
                 with open(db_path / "database.json", "w", encoding="utf-8") as file:
                     for table in database.tables:

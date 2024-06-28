@@ -163,7 +163,7 @@ def handle_line(
 
 
         # visualize the schema
-        create_schema_diagram(database=database_to_process, save_path=db_folder, show_diagram=False)
+        create_schema_diagram(tables=final_tables, save_path=db_folder, show_diagram=False)
 
         with open(db_folder / "database.json", "w", encoding="utf-8") as file:
             for table in database_to_process.tables:

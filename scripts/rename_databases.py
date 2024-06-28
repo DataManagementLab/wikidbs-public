@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import multiprocessing
+import multiprocessing.dummy
 import time
 from pathlib import Path
 import ast
@@ -37,6 +38,13 @@ def start_renaming(cfg: DictConfig):
     before = time.time()
     if cfg.processes is None:
         for db_folder in tqdm(dbs_to_rename, "handle dbs"):
+            dummy_semaphore = multiprocessing.dummy.Semaphore()
+            dummy_history =  {"rpm_budget": None, "tpm_budget": None, "last_update": None}
+            handle_db(db_folder=db_folder, 
+                      output_path=output_path,
+                      history_semaphore=dummy_semaphore,
+                      history=dummy_history, 
+                      cfg=cfg)
             handle_db(db_folder=db_folder, output_path=output_path, cfg=cfg)
     else:
         with multiprocessing.Manager() as manager:

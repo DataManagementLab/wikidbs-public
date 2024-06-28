@@ -3,6 +3,7 @@ import unicodedata
 from pathlib import Path
 import logging
 import random
+import pandas as pd
 
 log = logging.getLogger(__name__)
 
@@ -159,9 +160,15 @@ def postprocess_name(name: str, mode: str) -> str:
     else:
         raise NotImplementedError(f"Invalid renaming mode '{mode}'!")
 
-def majority_type(column):
+def majority_type(column_values):
     # Extract datatypes from the tuples
-    types = [t[2] for t in column if t is not None]
+    types = []
+    for col in column_values:
+        # col might be nan
+        if isinstance(col, tuple) or isinstance(col, list):
+            col_type = col[2]
+            if col_type is not None:
+                types.append(col_type)
     # Count the occurrences of each type
     type_count = Counter(types)
     # Get the most common type

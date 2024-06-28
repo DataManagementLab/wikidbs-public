@@ -4,6 +4,7 @@ from slugify import slugify  ## python-slugify from https://github.com/un33k/pyt
 from pathlib import Path
 import graphviz
 import random
+import pandas as pd
 
 import wikidbs.schema
 

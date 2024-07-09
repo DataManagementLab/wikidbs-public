@@ -38,7 +38,7 @@ python -m pip install -r requirements.txt
 
 We provide two options, the first one (3a) is to import our pre-processed MongoDB export archive file into your MongoDB instance, which will save a lot of time and effort. If you want to do all the necessary steps from scratch yourself, refer to option 3b:
 
-### 3a: Load our pre-processed MongoDB export
+### 3a: Load our pre-processed Wikidata MongoDB export
 
 1. Copy the wikidata_mongodb_archive.gz file from our downloads to the mongo-data folder that you created in step 1.4.
 
@@ -46,12 +46,6 @@ We provide two options, the first one (3a) is to import our pre-processed MongoD
 
 ```
 docker exec -it <container_name> bash
-```
-
-and then run 
-
-```
-mongosh
 ```
 
 3. Import the archive by running:
@@ -64,6 +58,8 @@ mongosh
 
 
 ### 3b: Pre-processing from scratch
+
+To do the pre-processing of the dump from scratch, follow these steps:
 
 1. Download the Wikidata dump
 The dataset is based on the Wikidata json dump, the latest dump ("latest-all.json.gz") can be downloaded here: https://dumps.wikimedia.org/wikidatawiki/entities/ (around 115GB)

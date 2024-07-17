@@ -34,6 +34,12 @@ then activate your environment and run:
 python -m pip install -r requirements.txt
 ```
 
+as well as
+
+```
+python -m pip install --editable .
+```
+
 ## Part 3: Load Wikidata into the MongoDB
 
 We provide two options, the first one (3a) is to import our pre-processed MongoDB export archive file into your MongoDB instance, which will save a lot of time and effort. If you want to do all the necessary steps from scratch yourself, refer to option 3b:

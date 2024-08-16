@@ -46,7 +46,7 @@ We provide two options, the first one (3a) is to import our pre-processed MongoD
 
 ### 3a: Load our pre-processed Wikidata MongoDB export
 
-1. Copy the wikidata_mongodb_archive.gz file from our downloads to the mongo-data folder that you created in step 1.4.
+1. Copy the wikidata_mongodb_archive.gz (~ 13.2GB) file from our downloads to the mongo-data folder that you created in step 1.4. Around 40GB of disk space are required for the mongo-data folder. 
 
 2. Log into the MongoDB Shell by executing:
 
@@ -60,7 +60,7 @@ docker exec -it <container_name> bash
  mongorestore --archive=data/db/wikidata_mongodb_archive.gz --gzip --verbose
 ```
 
-(this should take around 30 minutes)
+(this takes around 60 minutes on an Intel(R) Xeon(R) Gold 5120 CPU @ 2.20GHz)
 
 
 ### 3b: Pre-processing from scratch
@@ -68,7 +68,7 @@ docker exec -it <container_name> bash
 To do the pre-processing of the dump from scratch, follow these steps:
 
 1. Download the Wikidata dump
-The dataset is based on the Wikidata json dump, the latest dump ("latest-all.json.gz") can be downloaded here: https://dumps.wikimedia.org/wikidatawiki/entities/ (around 115GB)
+The dataset is based on the Wikidata json dump, the latest dump ("latest-all.json.gz") can be downloaded here: https://dumps.wikimedia.org/wikidatawiki/entities/ (needs around 115GB of disk space)
 
 ```
  wget https://dumps.wikimedia.org/wikidatawiki/entities/ 
@@ -100,7 +100,12 @@ This will take max. 40h, depending on the settings for 'label_names_min_num_rows
 
 Adapt the settings in 'conf/databases.yaml' to your needs.
 
-We provide a script to run the full pipeline to create database per database, and we provide performance optimized scripts for the stages of crawling, renaming and postprocessing individually.
+We provide a script to run the full pipeline to create database per database, and we provide performance optimized scripts for the stages of crawling, renaming and postprocessing individually. On average around 5MB of disk space are necessary for each created database.
+
+Our scripts are scalable and the number of workers for creating databases in parallel can be specified in our configuration file.
+On an Intel(R) Xeon(R) Gold 5120 CPU @ 2.20GHz we observe the following resource consumption:
+1 CPU core per worker and ~25GiB RAM per worker.
+Each worker creates approximately 20 databases per hour on our system.
 
 To run the full pipeline: 
 

@@ -1,3 +1,6 @@
+![WikiDBs logo](assets/WikiDBs.png)
+![WikiDBs authors](assets/authors.png)
+
 # WikiDBs: A large-scale corpus of relational databases from wikidata 
 
 This repository contains the code for WikiDBs (https://wikidbs.github.io/), a corpus of relational databases based on Wikidata (https://www.wikidata.org/).

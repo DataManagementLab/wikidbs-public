@@ -2,6 +2,7 @@ import hydra
 from omegaconf import DictConfig
 import logging
 from pathlib import Path
+from collections import Counter
 
 from wikidbs.convert import convert_profiling_dict_to_jsonlines
 from wikidbs.visualize import visualize_row_statistics

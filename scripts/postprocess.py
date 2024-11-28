@@ -1,20 +1,18 @@
+import ast
 import json
 import logging
-import math
-import multiprocessing
-import random
-import re
+import shutil
 import time
-import ast
 from pathlib import Path
-import unicodedata
 
+import cattrs
 import hydra
 from omegaconf import DictConfig
+from pqdm.processes import pqdm
 from tqdm import tqdm
 
-from wikidbs import utils
 import wikidbs.schema
+from wikidbs import utils
 from wikidbs.database import Database
 from wikidbs.serialization import converter
 from wikidbs.visualize import create_schema_diagram
@@ -22,249 +20,143 @@ from wikidbs.visualize import create_schema_diagram
 log = logging.getLogger(__name__)
 
 
+def _load_database(db_path: Path) -> Database:
+    with open(db_path / "database.json", "r", encoding="utf-8") as file:
+        db = converter.structure(json.load(file), Database)
+    for table in db.tables:
+        table.table_df.columns = [ast.literal_eval(col) for col in table.table_df.columns]
+        if table.llm_renamed_df is not None:
+            table.llm_renamed_df.columns = [ast.literal_eval(col) for col in table.llm_renamed_df.columns]
+    return db
+
+
+def postprocess_database(args: tuple[int, Path, Path, DictConfig]) -> None:
+    db_idx, db_path, output_path, cfg = args
+    db = _load_database(db_path)
+
+    # create directories
+    output_db_path = output_path / db_path.name
+
+    output_db_path.mkdir()
+    output_tables_path = output_db_path / "tables"
+    output_tables_path.mkdir()
+    output_tables_with_item_ids_path = output_db_path / "tables_with_item_ids"
+    output_tables_with_item_ids_path.mkdir()
+
+    out_tables = []
+    for table in db.tables:
+        column_types = {col: utils.majority_type(table.table_df[col]) for col in table.table_df.columns}
+        out_columns = []
+        for col_idx, col_name in enumerate(table.llm_renamed_df.columns):
+            col_name = col_name[0]
+            orig_column = table.table_df.columns[col_idx]
+            col_datatype = column_types[orig_column]
+            col_pid = table.table_df.columns[col_idx][1]
+            if col_idx <= 1:
+                col_pid = None
+            out_columns.append(
+                wikidbs.schema.Column(
+                    column_name=col_name,
+                    alt_column_names=[table.llm_only_column_names[col_idx], orig_column[0]],
+                    wikidata_property_id=col_pid,
+                    data_type=col_datatype
+                )
+            )
+
+        out_foreign_keys = []
+        for fk in table.foreign_keys:
+            column_idx = None
+            for ix, col in enumerate(table.table_df.columns.to_list()):
+                if col[0] == fk.column_name:
+                    assert column_idx is None
+                    column_idx = ix
+            assert column_idx is not None
+            column_name = table.llm_renamed_df.columns.to_list()[column_idx][0]  # we want the name, nothing else
+
+            ref_tables = [tab for tab in db.tables if tab.table_name == fk.reference_table_name]
+            if len(ref_tables) != 1:
+                log.error("FK relationship without reference table! ==> skip")
+                continue
+            ref_table = ref_tables[0]
+
+            out_foreign_keys.append(
+                wikidbs.schema.ForeignKey(
+                    column=column_name,
+                    reference_column=ref_table.llm_renamed_df.columns.to_list()[0][0],  # we want the name, nothing else
+                    reference_table=ref_table.llm_table_name
+                )
+            )
+
+        out_tables.append(
+            wikidbs.schema.Table(
+                table_name=table.llm_table_name,
+                alt_table_names=[table.llm_only_table_name, table.table_name],
+                file_name=f"{table.llm_table_name}.csv",
+                columns=out_columns,
+                foreign_keys=out_foreign_keys
+            )
+        )
+
+        filename = f"{table.llm_table_name}.csv"
+        table_df_save = table.llm_renamed_df.map(lambda x: x[0] if isinstance(x, list) else x)
+        table_df_save.columns = table_df_save.columns.map(lambda x: x[0] if isinstance(x, tuple) else x)
+        table_df_save.to_csv(output_tables_path / filename, index=False)
+
+        table_df_save = table.llm_renamed_df.map(lambda x: x[1] if isinstance(x, list) else x)
+        table_df_save.columns = table_df_save.columns.map(lambda x: x[0] if isinstance(x, tuple) else x)
+        table_df_save.to_csv(output_tables_with_item_ids_path / filename, index=False)
+
+    out_schema = wikidbs.schema.Schema(
+        database_name=db.llm_db_name,
+        alt_database_names=[db.llm_only_db_name, db.db_name],
+        wikidata_property_id=db.start_table.predicate["id"],
+        wikidata_property_label=db.start_table.predicate["label"],
+        wikidata_topic_item_id="Q" + db.start_table.object["id"],
+        wikidata_topic_item_label=db.start_table.object["label"],
+        tables=out_tables
+    )
+
+    with open(output_db_path / "schema.json", "w", encoding="utf-8") as file:
+        json.dump(cattrs.unstructure(out_schema), file, indent=4)
+
+    for table in out_schema.tables:
+        for fk in table.foreign_keys:
+            assert fk.column in [c.column_name for c in table.columns]
+            ref_tables = [t for t in out_schema.tables if t.table_name == fk.reference_table]
+            if len(ref_tables) > 1:
+                breakpoint()
+            assert len(ref_tables) == 1, len(ref_tables)
+            ref_table = ref_tables[0]
+            assert fk.reference_column in [c.column_name for c in ref_table.columns]
+
+    create_schema_diagram(tables=out_tables, save_path=output_db_path, show_diagram=False)
+
+    out_schema.validate(output_db_path)
+
+
 @hydra.main(version_base=None, config_path="../conf", config_name="postprocess.yaml")
 def start_postprocessing(cfg: DictConfig):
     # create output folder if necessary
     output_path = Path(f"{cfg.output_folder}")
-    output_path.mkdir(parents=True, exist_ok=True)
+    if output_path.is_dir():
+        shutil.rmtree(output_path)
+    output_path.mkdir(parents=True)
 
-    dbs_to_process = [x for x in list(Path(cfg.input_folder).iterdir()) if x.is_dir()]
-    dbs_to_process = dbs_to_process[:cfg.limit]
+    dbs_to_process = [x for x in sorted(Path(cfg.input_folder).iterdir()) if x.is_dir()][:cfg.limit]
+    log.info(f"Post-process {len(dbs_to_process)} databases from {cfg.input_folder}.")
 
-    log.info(f"Starting to post-process databases from {cfg.input_folder}, limit is {cfg.limit}, plan to rename {(len(dbs_to_process))}")
-
+    args = [(db_idx, db_path, output_path, cfg) for db_idx, db_path in enumerate(dbs_to_process)]
 
     before = time.time()
-    if cfg.processes is None:
-
-        for db_to_process in tqdm(dbs_to_process, "handle lines"):
-            handle_line(db_to_process, output_path, cfg)
-    else:
-        line_group_size = math.ceil(len(dbs_to_process) / cfg.processes)
-        line_groups = []
-        for left in range(0, len(dbs_to_process), line_group_size):
-            line_groups.append(dbs_to_process[left:left + line_group_size])
-        all_params = [(line_group, output_path, cfg) for line_group in line_groups]
-
-        with multiprocessing.Pool(cfg.processes) as pool:
-            for _ in pool.imap(wrapper, all_params):
-                pass
+    for _ in pqdm(
+            args,
+            postprocess_database,
+            desc="postprocess databases",
+            n_jobs=cfg.processes,
+            exception_behaviour="immediate"
+    ):
+        pass
     log.info(f"Done! Processed DBs in {time.time() - before:.2f} seconds.")
-
-
-def handle_line(
-        db_folder: Path,
-        output_path: Path,
-        cfg: DictConfig
-) -> dict | None:
-   
-    # check if database has already been renamed
-    if output_path / db_folder.name in list(output_path.iterdir()):
-        log.info(f"DB {db_folder.name} has already be post-processed")
-        return
-
-    try: 
-        log.info(f"Database: *{db_folder.name}")
-
-        assert Path(db_folder / "database.json").exists()
-
-        # load database
-        with open(db_folder / "database.json", "r", encoding="utf-8") as file:
-            database_to_process = converter.structure(json.load(file), Database)
-        # convert dataframe tuples back to real tuples:
-        for table in database_to_process.tables:
-            table.table_df.columns = [ast.literal_eval(col) for col in table.table_df.columns]
-
-        # load renaming info
-        with open(db_folder / "llm_renaming_cased.json", "r", encoding="utf-8") as file:
-            renaming_info = json.load(file)
-
-        # create schema information
-        final_tables = []
-        col_names_first_col = {}
-        columns_per_table = {}
-
-        for table_idx, table in enumerate(database_to_process.tables):
-            orig_table = database_to_process.tables[table_idx]
-
-            # Determine the datatype for each column
-            column_types = {col: utils.majority_type(orig_table.table_df[col]) for col in orig_table.table_df.columns}
-            table_columns = []
-
-            for col_idx, col_name in enumerate(table.llm_renamed_df.columns):
-                col_name = col_name[0]
-                orig_column = orig_table.table_df.columns[col_idx]
-                col_datatype = column_types[orig_column]
-                col_pid = orig_table.table_df.columns[col_idx][1]
-                if col_idx <= 1:
-                    col_pid = None
-                column = wikidbs.schema.Column(column_name = col_name,
-                                            wikidata_property_id=col_pid,
-                                            data_type = col_datatype)
-                table_columns.append(column)
-                            
-                if col_idx == 0:
-                    col_names_first_col[table.llm_table_name] = col_name
-            columns_per_table[table.llm_table_name] = table_columns
-
-        Path(db_folder / "tables").mkdir()
-        Path(db_folder / "tables_with_item_ids").mkdir()
-
-        for table_idx, table in enumerate(database_to_process.tables):
-            # handle foreign keys (need to update fk names after paraphrasing)
-            foreign_keys = []
-            for fk in table.foreign_keys:
-                orig_fk_col = fk.column_name
-                fk_col = renaming_info[table.table_name]["columns"][orig_fk_col]
-
-                orig_fk_reference_table = fk.reference_table_name
-                fk_reference_table = renaming_info[orig_fk_reference_table][orig_fk_reference_table]
-
-                reference_col = col_names_first_col[fk_reference_table]
-
-                schema_fk = wikidbs.schema.ForeignKey(column=fk_col,
-                                                    reference_column=reference_col,
-                                                    reference_table=fk_reference_table)
-                foreign_keys.append(schema_fk)
-                
-            schema_table = wikidbs.schema.Table(table_name=table.llm_table_name,
-                                                file_name=str(table.llm_table_name) + ".csv",
-                                                columns=columns_per_table[table.llm_table_name],
-                                                foreign_keys=foreign_keys)
-            final_tables.append(schema_table)
-
-
-            ## save csv files (with and without qids)
-            filename = table.llm_table_name + ".csv"
-            table_df_save = table.llm_renamed_df.map(lambda x: x[0] if isinstance(x, list) else x)
-            table_df_save.columns = table_df_save.columns.map(lambda x: x[0] if isinstance(x, tuple) else x)
-            table_df_save.to_csv(db_folder / "tables" / filename, index=False)
-
-            ## prepare final df with qids
-            orig_table = database_to_process.tables[table_idx]
-            table_df_save = orig_table.table_df.map(lambda x: (x[0], x[1]) if isinstance(x, list) else x)
-            table_df_save.columns = table.columns #cols_with_pid
-
-            table_df_save.to_csv(db_folder / "tables_with_item_ids" / filename, index=False)
-
-        start_table = database_to_process.tables[0]
-        ### Create schema (needs database name and tables)
-        database_name = database_to_process.db_name
-        schema = wikidbs.schema.Schema(database_name=database_name,
-                                    wikidata_property_id=start_table.predicate["id"],
-                                    wikidata_property_label=start_table.predicate["label"],
-                                    wikidata_topic_item_id="Q"+start_table.object["id"],
-                                    wikidata_topic_item_label=start_table.object["label"],
-                                    tables=final_tables)
-
-        ###########################
-        # serialize schema to disk 
-        ###########################
-        with open(db_folder / "schema.json", "w", encoding="utf-8") as file:
-            json.dump(converter.unstructure(schema), file, indent=2)
-
-        with open(db_folder / "schema.json", "r", encoding="utf-8") as file:
-            schema_test_load = converter.structure(json.load(file), wikidbs.schema.Schema)
-
-
-        # visualize the schema
-        create_schema_diagram(tables=final_tables, save_path=db_folder, show_diagram=False)
-
-        with open(db_folder / "database.json", "w", encoding="utf-8") as file:
-            for table in database_to_process.tables:
-                table.rows = None  # cannot serialize rows since dict keys are tuples...
-                table.full_properties_with_outgoing_items = None  # cannot serialize...
-                table.properties_with_outgoing_items = None  # cannot serialize...
-            json.dump(converter.unstructure(database_to_process), file)
-
-        with open(db_folder / "database.json", "r", encoding="utf-8") as file:
-            database_test_load = converter.structure(json.load(file), Database)
-
-    except Exception as e:
-        log.warning(f"Failed to post-process database {db_folder.name}", exc_info=True)
-
-        if isinstance(e, NotImplementedError):
-            raise NotImplementedError(e)
-
-    return 
-
-# EXECUTE ONCE PER RUN
-postprocess_names_random = random.Random(469866043)
-postprocess_name_modes = [
-    # "no_lowercase",  # 'countryname'
-    # "no_uppercase",  # 'COUNTRYNAME'
-    "no_pascal",  # 'CountryName'
-    "no_pascal",  # 'CountryName'
-    "no_pascal",  # 'CountryName'
-    "spaces_lowercase",  # 'country name'
-    "spaces_uppercase",  # 'COUNTRY NAME'
-    "spaces_pascal",  # 'Country Name'
-    "underscores_lowercase",  # 'country_name'
-    "underscores_uppercase",  # 'COUNTRY_NAME'
-    "underscores_pascal",  # 'Country_Name'
-    "hyphen_lowercase",  # 'country-name'
-    "hyphen_uppercase",  # 'COUNTRY-NAME'
-    "hyphen_pascal",  # 'Country-Name'
-]
-
-def is_camel_case_naive(s: str):
-  is_camel = True
-  if s[1:] == s[1:].lower():
-    is_camel = False
-  if s[1:] == s[1:].upper():
-    is_camel = False
-  if " " in s:
-    is_camel = False
-  if "_" in s:
-    is_camel = False
-  return is_camel
-
-def postprocess_name(name: str, mode: str) -> str:
-    # do not allow unicode, taken from https://github.com/django/django/blob/master/django/utils/text.py
-    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    name = re.sub(r"[^\w\s-]", "", name)
-
-    # split into parts
-    name = re.sub(r"[-\s]+", "-", name).strip("-_")
-    parts = name.split("-")
-    parts = [p for part in parts for p in part.split("_")]
-    parts = [p for p in parts if len(p) > 0]
-
-    assert len(parts) > 0, "There must be at least one name part!"
-
-    # adapt casing
-    if mode.endswith("lowercase") or mode.endswith("pascal"):
-        parts = [part.lower() for part in parts]
-    elif mode.endswith("uppercase"):
-        parts = [part.upper() for part in parts]
-
-    if mode.endswith("pascal"):
-        parts = [part[0].upper() + part[1:] for part in parts]
-
-    # join parts
-    if mode.startswith("no"):
-        return "".join(parts)
-    elif mode.startswith("spaces"):
-        return " ".join(parts)
-    elif mode.startswith("underscores"):
-        return "_".join(parts)
-    elif mode.startswith("hyphen"):
-        return "-".join(parts)
-    else:
-        raise NotImplementedError(f"Invalid renaming mode '{mode}'!")
-
-
-def handle_line_group(
-        line_group,
-        output_path: Path,
-        cfg: DictConfig
-) -> list[dict | None]:
-    
-    return [handle_line(line, output_path, cfg) for line in line_group]
-
-
-def wrapper(args):
-    return handle_line_group(*args)
 
 
 if __name__ == "__main__":

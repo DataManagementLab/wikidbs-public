@@ -1,7 +1,9 @@
 import logging
 import pandas as pd
+from pathlib import Path
 
 from wikidbs.utils import differentiate_datatype
+from wikidbs.table import Table
 
 log = logging.getLogger(__name__)
 

@@ -11,7 +11,7 @@ setup(
     
     description="Crawling a dataset of relational databases from wikidata",
 
-    author="Liane Vogel",
+    author="Liane Vogel, Jan-Micha Bodensohn",
 
     packages=['wikidbs'],
 

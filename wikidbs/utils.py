@@ -9,6 +9,8 @@ log = logging.getLogger(__name__)
 
 from collections import Counter, defaultdict
 
+from wikidbs.table import Table, ForeignKey
+
 def differentiate_datatype(datatype: str):
     if datatype == "string":
         return "value"
@@ -60,7 +62,7 @@ def slugify(value, allow_unicode=False):
     underscores, or hyphens. Convert to lowercase. Also strip leading and
     trailing whitespace, dashes, and underscores.
     """
-    assert not "___" in value, print(value)
+    #assert not "___" in value, print(value)
     value = str(value)
     if allow_unicode:
         value = unicodedata.normalize('NFKC', value)
@@ -85,7 +87,7 @@ def find_duplicates_positions(lst):
 
     # Populate the dictionary with positions
     for index, item in enumerate(lst):
-        positions[item].append(index)
+        positions[item.lower()].append(index)
 
     # Extract only the items that have duplicates (more than one position)
     duplicate_positions = []
@@ -95,70 +97,6 @@ def find_duplicates_positions(lst):
 
     return duplicate_positions
 
-
-postprocess_names_random = random.Random(469866043)
-postprocess_name_modes = [
-    # "no_lowercase",  # 'countryname'
-    # "no_uppercase",  # 'COUNTRYNAME'
-    "no_pascal",  # 'CountryName'
-    "no_pascal",  # 'CountryName'
-    "no_pascal",  # 'CountryName'
-    "spaces_lowercase",  # 'country name'
-    "spaces_uppercase",  # 'COUNTRY NAME'
-    "spaces_pascal",  # 'Country Name'
-    "underscores_lowercase",  # 'country_name'
-    "underscores_uppercase",  # 'COUNTRY_NAME'
-    "underscores_pascal",  # 'Country_Name'
-    "hyphen_lowercase",  # 'country-name'
-    "hyphen_uppercase",  # 'COUNTRY-NAME'
-    "hyphen_pascal",  # 'Country-Name'
-]
-
-def is_camel_case_naive(s: str):
-  is_camel = True
-  if s[1:] == s[1:].lower():
-    is_camel = False
-  if s[1:] == s[1:].upper():
-    is_camel = False
-  if " " in s:
-    is_camel = False
-  if "_" in s:
-    is_camel = False
-  return is_camel
-
-def postprocess_name(name: str, mode: str) -> str:
-    # do not allow unicode, taken from https://github.com/django/django/blob/master/django/utils/text.py
-    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    name = re.sub(r"[^\w\s-]", "", name)
-
-    # split into parts
-    name = re.sub(r"[-\s]+", "-", name).strip("-_")
-    parts = name.split("-")
-    parts = [p for part in parts for p in part.split("_")]
-    parts = [p for p in parts if len(p) > 0]
-
-    assert len(parts) > 0, "There must be at least one name part!"
-
-    # adapt casing
-    if mode.endswith("lowercase") or mode.endswith("pascal"):
-        parts = [part.lower() for part in parts]
-    elif mode.endswith("uppercase"):
-        parts = [part.upper() for part in parts]
-
-    if mode.endswith("pascal"):
-        parts = [part[0].upper() + part[1:] for part in parts]
-
-    # join parts
-    if mode.startswith("no"):
-        return "".join(parts)
-    elif mode.startswith("spaces"):
-        return " ".join(parts)
-    elif mode.startswith("underscores"):
-        return "_".join(parts)
-    elif mode.startswith("hyphen"):
-        return "-".join(parts)
-    else:
-        raise NotImplementedError(f"Invalid renaming mode '{mode}'!")
 
 def majority_type(column_values):
     # Extract datatypes from the tuples

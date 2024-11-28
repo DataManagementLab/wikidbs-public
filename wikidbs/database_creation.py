@@ -1,6 +1,8 @@
 from omegaconf import DictConfig
 
 import logging
+import json
+from pathlib import Path
 import pandas as pd
 import random
 
@@ -12,6 +14,8 @@ from wikidbs.database import Database
 from wikidbs.connected_table_creation import create_connected_table
 
 log = logging.getLogger(__name__)
+
+_select_fk_random = random.Random(3542845)
 
 def create_database_for_topic(cfg: DictConfig, db, topic_dict: dict, properties_lookup_df: pd.DataFrame, embedding_model: SentenceTransformer, wikidata_labels: dict, wikidata_properties):
     """
@@ -49,7 +53,7 @@ def create_database_for_topic(cfg: DictConfig, db, topic_dict: dict, properties_
     start_table.find_outgoing_relations(cfg.min_rows, embedding_model=embedding_model)
 
     if len(start_table.possible_relations) == 0:
-        log.error(f"No outgoing relations from main table, can't build database")
+        log.error(f"{topic_dict['idx']} No outgoing relations from main table, can't build database")
         return None
 
     ###########################################

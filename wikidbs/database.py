@@ -1,10 +1,11 @@
 # a database consists of tables that are connected via foreign keys
 import collections
 import pathlib
-import sqlite3
+#import sqlite3
 from pathlib import Path
 
 import attrs
+import numpy as np
 import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer, util
@@ -21,6 +22,8 @@ class Database:
     foreign_keys: list[ForeignKey]
     semantic_embedding: torch.Tensor | None
     db_name: str | None
+    llm_db_name: str | None = None
+    llm_only_db_name: str | None = None
 
     @classmethod
     def from_start_table(cls, start_table: Table) -> "Database":
@@ -58,6 +61,10 @@ class Database:
                     table_df_save = table.table_df
             table_df_save.to_csv(path / filename, index=False)
 
+    def visualize_schema(self):
+        # visualization.create_schema_diagram(schema_information=schema_information, topic_path=db_path, show_diagram=False)
+        raise NotImplementedError
+
     def get_table(self, table_name):
         for table in self.tables:
             if table.table_name == table_name:
@@ -82,8 +89,7 @@ class Database:
             cosine_scores.append(cos_sim.item())
             relation.current_similarity = cos_sim.item()
 
-        # get position of maximum score, then take the relation on this position as next relation
-        max_idx = cosine_scores.index(max(cosine_scores)) 
+        max_idx = cosine_scores.index(max(cosine_scores))  
         max_score = max(cosine_scores)
         most_similar_relation = self.further_relations[max_idx]
         self.further_relations.pop(max_idx)
@@ -98,7 +104,6 @@ class Database:
             val_conn.set_trace_callback(lambda s: val_stmts.append(s))
             ids_conn.set_trace_callback(lambda s: ids_stmts.append(s))
 
-            # change db name
             for table in reversed(self.tables):  # reverse so that the reference constraints work
 
                 ########################################################################################################
@@ -121,7 +126,7 @@ class Database:
 
                 col2datatype = {llm_col_name: list(datatypes)[0] for llm_col_name, datatypes in col2datatypes.items()}
 
-                type_mappings = {  # TODO: improve type mappings
+                type_mappings = {  
                     "string": "TEXT",
                     "wikibase-entityid": "TEXT",
                     "quantity": "REAL",
@@ -133,7 +138,7 @@ class Database:
                 val_ct_columns, ids_ct_columns = [], []
                 fk_constraints = []
                 for llm_triple, triple in zip(table.llm_renamed_df.columns, table.table_df.columns):
-                    val_ct_columns.append(f""""{llm_triple[0]}" {type_mappings[col2datatype.get(llm_triple[0], "TEXT")]}""")  # TODO: uniqueness/primary key, nullability...
+                    val_ct_columns.append(f""""{llm_triple[0]}" {type_mappings[col2datatype.get(llm_triple[0], "TEXT")]}""") 
                     ids_ct_columns.append(f""""{llm_triple[0]}_qid" TEXT""")  # QID is always TEXT
 
                     for foreign_key in self.foreign_keys:
@@ -146,7 +151,7 @@ class Database:
                                     assert llm_ref_table_name is None
                                     llm_ref_table_name = t.llm_table_name
                                     for llm_trip, trip in zip(t.llm_renamed_df, t.table_df):
-                                        if trip[0] == "label":  # TODO: assumes foreign keys always reference label column
+                                        if trip[0] == "label":  
                                             assert llm_ref_col_name is None
                                             llm_ref_col_name = llm_trip[0]
 

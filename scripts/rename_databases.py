@@ -1,190 +1,341 @@
+import ast
+import collections
+import hashlib
+import itertools
 import json
 import logging
-import math
-import multiprocessing
-import multiprocessing.dummy
+import random
+import shutil
 import time
 from pathlib import Path
-import ast
 
 import hydra
 from omegaconf import DictConfig
-from tqdm import tqdm
+from pqdm.processes import pqdm
 
 from wikidbs.database import Database
-from wikidbs.openai import openai_cost_for_cache
-from wikidbs.rename import rename
+from wikidbs.openai_batch import openai_batches_create, openai_batches_execute
+from wikidbs.rename import create_rename_start_table_request, rename_start_table, \
+    create_rename_connected_table_request, rename_connected_table, postprocess_name_modes, \
+    postprocess_name
 from wikidbs.serialization import converter
-from wikidbs.utils import postprocess_name, postprocess_names_random, postprocess_name_modes, is_camel_case_naive
-
 
 log = logging.getLogger(__name__)
 
+RENAME_START_TABLES_PREFIX = "wikidbs-rename-start-table"
+RENAME_CONNECTED_TABLES_PREFIX = "wikidbs-rename-connected-table"
+
+
+def _load_database(db_path: Path) -> Database:
+    with open(db_path / "database.json", "r", encoding="utf-8") as file:
+        db = converter.structure(json.load(file), Database)
+    for table in db.tables:
+        table.table_df.columns = [ast.literal_eval(col) for col in table.table_df.columns]
+        if table.llm_renamed_df is not None:
+            table.llm_renamed_df.columns = [ast.literal_eval(col) for col in table.llm_renamed_df.columns]
+    return db
+
+
+def _save_database(database: Database, db_path: Path) -> None:
+    for table in database.tables:
+        table.rows = None  # cannot serialize rows since dict keys are tuples...
+        table.full_properties_with_outgoing_items = None  # cannot serialize...
+        table.properties_with_outgoing_items = None  # cannot serialize...
+    with open(db_path / "database.json", "w", encoding="utf-8") as file:
+        json.dump(converter.unstructure(database), file)
+
+
+def create_rename_start_table_request_for_database(args: tuple[DictConfig, int, Path]) -> dict:
+    cfg, db_idx, db_path = args
+
+    db = _load_database(db_path)
+    request = create_rename_start_table_request(cfg, db)
+
+    return {
+        "custom_id": f"{db_idx}-{db_path.name}-start-table-request",
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": request
+    }
+
 
 @hydra.main(version_base=None, config_path="../conf", config_name="rename.yaml")
-def start_renaming(cfg: DictConfig):
+def create_rename_start_table_request_batches(cfg: DictConfig) -> None:
+    log.info(f"Create {RENAME_START_TABLES_PREFIX} request batches for databases from {cfg.input_folder}.")
 
-    # create data and profiling folder if necessary
-    output_path = Path(f"{cfg.output_folder}")
-    output_path.mkdir(parents=True, exist_ok=True)
+    # scan databases to rename
+    dbs_to_rename = [x for x in sorted(Path(cfg.input_folder).iterdir()) if x.is_dir()][:cfg.limit]
+    args = [(cfg, db_idx, db_path) for db_idx, db_path in enumerate(dbs_to_rename)]
 
-    dbs_to_rename = [x for x in list(Path(cfg.input_folder).iterdir()) if x.is_dir()]
-    dbs_to_rename = dbs_to_rename[:cfg.limit]
+    # handle databases
+    wrapped_requests = []
+    for wrapped_request in pqdm(
+            args,
+            create_rename_start_table_request_for_database,
+            desc="create rename start table request batches",
+            n_jobs=cfg.processes,
+            exception_behaviour="immediate"
+    ):
+        wrapped_requests.append(wrapped_request)
 
-    log.info(f"Starting to rename databases from {cfg.input_folder}, limit is {cfg.limit}, plan to rename {(len(dbs_to_rename))}")
-
-    total_cost_before = openai_cost_for_cache()
-
-    before = time.time()
-    if cfg.processes is None:
-        for db_folder in tqdm(dbs_to_rename, "handle dbs"):
-            dummy_semaphore = multiprocessing.dummy.Semaphore()
-            dummy_history =  {"rpm_budget": None, "tpm_budget": None, "last_update": None}
-            handle_db(db_folder=db_folder, 
-                      output_path=output_path,
-                      history_semaphore=dummy_semaphore,
-                      history=dummy_history, 
-                      cfg=cfg)
-            handle_db(db_folder=db_folder, output_path=output_path, cfg=cfg)
-    else:
-        with multiprocessing.Manager() as manager:
-            history_semaphore = manager.Semaphore()
-            history = manager.dict(rpm_budget=None, tpm_budget=None, last_update=None)
-            line_group_size = math.ceil(len(dbs_to_rename) / cfg.processes)
-            line_groups = []
-            for left in range(0, len(dbs_to_rename), line_group_size):
-                line_groups.append(dbs_to_rename[left:left + line_group_size])
-            all_params = [(line_group, output_path, history_semaphore, history, cfg) for line_group in line_groups]
-            with multiprocessing.Pool(cfg.processes) as pool:
-                for _ in pool.imap(wrapper, all_params):
-                    pass # currently doesn't return anything
-    log.info(f"Processed lines in {time.time() - before:.2f} seconds.")
-
-    before = time.time()
-
-    total_cost_after = openai_cost_for_cache()
-    log.info(f"Done renaming. This cost ${total_cost_after - total_cost_before:.4f}.")
+    # create batch files
+    openai_batches_create(
+        wrapped_requests,
+        Path(cfg.openai_folder) / RENAME_START_TABLES_PREFIX,
+        RENAME_START_TABLES_PREFIX
+    )
 
 
-def handle_db(
-        db_folder: Path,
-        output_path: Path,
-        history_semaphore,
-        history,
-        cfg: DictConfig
-) -> dict | None:
-    
-    # check if database has already been renamed
-    if output_path / db_folder.name in list(output_path.iterdir()):
-        log.info(f"DB {db_folder.name} has already be renamed")
-        return
+def rename_start_table_for_database(args: tuple[DictConfig, Path, Path, dict]) -> collections.Counter:
+    cfg, db_path, output_path, response = args
 
-    try:
+    db = _load_database(db_path)
+    db.db_name = db_path.name[db_path.name.index(" ") + 1:]
 
-        log.info("################################################################################################")
-        log.info(f"Database: *{db_folder.name}")
+    failures = rename_start_table(db, response)
 
-        # load database
-        with open(db_folder / "database.json", "r", encoding="utf-8") as file:
-            database_to_rename = converter.structure(json.load(file), Database)
-
-        if len(database_to_rename.tables) > 20:
-            log.info(f"DB has more than 20 tables, not renaming for now")
-            return
-
-        # convert dataframe tuples back to real tuples:
-        for table in database_to_rename.tables:
-            table.table_df.columns = [ast.literal_eval(col) for col in table.table_df.columns]
-
-        # rename
-        try:
-            rename(cfg=cfg, database=database_to_rename, responses_dir=output_path, history_semaphore=history_semaphore, history=history)
-        except Exception as e:
-            if isinstance(e, AssertionError):
-                raise AssertionError(e)
-            if isinstance(e, RuntimeError):
-                raise RuntimeError(e)
-            if isinstance(e, NotImplementedError):
-                raise NotImplementedError(e)
-
-            log.error(f"Exception: {e}, couldn't rename database {db_folder.name}")
-            return
-
-        # create output folder for db
-        db_output_path = Path(output_path / db_folder.name)
-        db_tables_path = db_output_path / "tables"
-        db_tables_path.mkdir(parents=True)
-
-        # standardize the casing of all table and column names in the database
-        mode = postprocess_names_random.choice(postprocess_name_modes)  
-        log.debug(f"Chosen case mode: {mode}")
-
-        # replace llm_dataframe of each table with the dataframe containing only the labels
-        for table in database_to_rename.tables:
-            # keep camel case table names as they are, naive check:
-            if not is_camel_case_naive(table.llm_table_name[0]):
-                new_table_name = postprocess_name(table.llm_table_name, mode=mode)
-            else: 
-                new_table_name = table.llm_table_name
-            
-            table.llm_table_name = new_table_name
-
-            new_col_names = []
-            for col in table.llm_renamed_df.columns:
-                new_col_name = postprocess_name(col, mode=mode)
-                new_col_names.append(new_col_name)
-            table.llm_renamed_df.columns = new_col_names
-
-            # save renaming info cased
-            renaming_info = {}
-            for table in database_to_rename.tables:
-                table_info = {}
-                try:
-                    table_info[table.table_name] = table.llm_table_name
-                    column_info = {}
-                    for col_idx, column in enumerate(table.table_df.columns):
-                        column_info[column[0]] = table.llm_renamed_df.columns[col_idx][0]
-                    table_info["columns"] = column_info
-                except AttributeError:
-                    # not all tables might have been renamed
-                    pass
-                renaming_info[table.table_name] = table_info
-            with open(db_folder / "llm_renaming_cased.json", "w", encoding="utf-8") as renaming_file:
-                json.dump(renaming_info, renaming_file, indent=2)
-
-        database_to_rename.tables_to_csv(db_tables_path, use_llm_names=False)
-
-        with open(db_output_path / "database.json", "w", encoding="utf-8") as file:
-            for table in database_to_rename.tables:
-                table.rows = None  # cannot serialize rows since dict keys are tuples...
-                table.full_properties_with_outgoing_items = None  # cannot serialize...
-                table.properties_with_outgoing_items = None  # cannot serialize...
-            json.dump(converter.unstructure(database_to_rename), file)
-
-        with open(db_output_path / "metadata.json", "w", encoding="utf-8") as metadata_file:
-            json.dump({ "db_name": database_to_rename.db_name,
-                        "num_tables": len(database_to_rename.tables),
-                        "num_cols": [len(table.table_df.columns) for table in database_to_rename.tables],
-                        "num_rows": [len(table.table_df) for table in database_to_rename.tables]}, metadata_file, indent=2)
-    except:
-        log.warning(f"Failed to rename database {db_folder.name}", exc_info=True)
-
-    return 
+    output_path.joinpath(db_path.name).mkdir()
+    _save_database(db, output_path / db_path.name)
+    return failures
 
 
-def handle_line_group(
-        line_group: list[str],
-        output_path: Path,
-        history_semaphore,
-        history,
-        cfg: DictConfig
-):
-    return [handle_db(db_folder=db_path, output_path=output_path, history_semaphore=history_semaphore, history=history, cfg=cfg) for db_path in line_group]
+@hydra.main(version_base=None, config_path="../conf", config_name="rename.yaml")
+def rename_start_tables(cfg: DictConfig) -> None:
+    log.info(f"Rename start tables.")
+    while True:
+        responses = openai_batches_execute(
+            Path(cfg.openai_folder) / RENAME_START_TABLES_PREFIX,
+            RENAME_START_TABLES_PREFIX
+        )
+
+        if responses is None:
+            log.error(f"{RENAME_START_TABLES_PREFIX} not fully executed, try again in 600 seconds.")
+            time.sleep(600)
+        else:
+            log.info(f"{RENAME_START_TABLES_PREFIX} fully executed, continue.")
+            break
+
+    responses = {r["custom_id"]: r for r in responses}
+
+    dbs_to_rename = [x for x in sorted(Path(cfg.input_folder).iterdir()) if x.is_dir()][:cfg.limit]
+    output_path = Path(cfg.output_folder)
+    if output_path.is_dir():
+        shutil.rmtree(output_path)
+    output_path.mkdir(parents=True)
+
+    args = []
+    for db_idx, db_path in enumerate(dbs_to_rename):
+        args.append((
+            cfg,
+            db_path,
+            output_path,
+            responses[f"{db_idx}-{db_path.name}-start-table-request"]["response"]["body"]
+        ))
+
+    # handle databases
+    failures = collections.Counter()
+    for fails in pqdm(
+            args,
+            rename_start_table_for_database,
+            desc="rename start tables",
+            n_jobs=cfg.processes,
+            exception_behaviour="immediate"
+    ):
+        failures += fails
+    log.info(f"{failures}")
 
 
-def wrapper(args):
-    return handle_line_group(*args)
+def create_rename_connected_table_request_for_database(args: tuple[DictConfig, int, Path]) -> list[dict]:
+    cfg, db_idx, db_path = args
+
+    db = _load_database(db_path)
+
+    res = []
+    for ct_idx, table_to_rename in enumerate(db.tables[1:]):
+        request = create_rename_connected_table_request(cfg, db, table_to_rename, db.foreign_keys)
+        res.append({
+            "custom_id": f"{db_idx}-{db_path.name}-{ct_idx}-{table_to_rename.table_name}-connected-table-request",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": request
+        })
+    return res
+
+
+@hydra.main(version_base=None, config_path="../conf", config_name="rename.yaml")
+def create_rename_connected_table_request_batches(cfg: DictConfig) -> None:
+    log.info(f"Create {RENAME_CONNECTED_TABLES_PREFIX} request batches for databases from {cfg.input_folder}.")
+
+    # scan databases to rename (dbs with renamed start tables are already in output folder)
+    dbs_to_rename = [x for x in sorted(Path(cfg.output_folder).iterdir()) if x.is_dir()][:cfg.limit]
+    args = [(cfg, db_idx, db_path) for db_idx, db_path in enumerate(dbs_to_rename)]
+
+    # handle databases
+    wrapped_requests = []
+    for wrapped_request_for_db in pqdm(
+            args,
+            create_rename_connected_table_request_for_database,
+            desc="create rename connected table request batches",
+            n_jobs=cfg.processes,
+            exception_behaviour="immediate"
+    ):
+        wrapped_requests += wrapped_request_for_db
+
+    # create batch files
+    openai_batches_create(
+        wrapped_requests,
+        Path(cfg.openai_folder) / RENAME_CONNECTED_TABLES_PREFIX,
+        RENAME_CONNECTED_TABLES_PREFIX
+    )
+
+
+def rename_connected_tables_for_database(args: tuple[DictConfig, int, Path, dict]) -> collections.Counter:
+    cfg, db_idx, db_path, responses = args
+
+    db = _load_database(db_path)
+    failures = collections.Counter()
+    for ct_idx, table_to_rename in enumerate(db.tables[1:]):
+        response = responses[f"{db_idx}-{db_path.name}-{ct_idx}-{table_to_rename.table_name}-connected-table-request"]
+        failures += rename_connected_table(table_to_rename, response)
+
+    _save_database(db, db_path)
+    return failures
+
+
+@hydra.main(version_base=None, config_path="../conf", config_name="rename.yaml")
+def rename_connected_tables(cfg: DictConfig) -> None:
+    log.info(f"Rename connected tables.")
+    while True:
+        responses = openai_batches_execute(
+            Path(cfg.openai_folder) / RENAME_CONNECTED_TABLES_PREFIX,
+            RENAME_CONNECTED_TABLES_PREFIX
+        )
+
+        if responses is None:
+            log.error(f"{RENAME_CONNECTED_TABLES_PREFIX} not fully executed, try again in 600 seconds.")
+            time.sleep(600)
+        else:
+            log.info(f"{RENAME_CONNECTED_TABLES_PREFIX} fully executed, continue.")
+            break
+
+    responses = {r["custom_id"]: r for r in responses}
+
+    dbs_to_rename = [x for x in sorted(Path(cfg.output_folder).iterdir()) if x.is_dir()][:cfg.limit]
+
+    args = []
+    for db_idx, db_path in enumerate(dbs_to_rename):
+        responses_for_db = {}
+        for key, value in responses.items():
+            if key.startswith(f"{db_idx}-{db_path.name}-") and key.endswith("-connected-table-request"):
+                responses_for_db[key] = value["response"]["body"]
+        args.append((
+            cfg,
+            db_idx,
+            db_path,
+            responses_for_db
+        ))
+
+    # handle databases
+    failures = collections.Counter()
+    for fails in pqdm(
+            args,
+            rename_connected_tables_for_database,
+            desc="rename connected tables",
+            n_jobs=cfg.processes,
+            exception_behaviour="immediate"
+    ):
+        failures += fails
+    log.info(f"{failures}")
+
+
+def postprocess_names_for_database(args: tuple[DictConfig, Path]) -> collections.Counter:
+    cfg, db_path = args
+
+    db = _load_database(db_path)
+    failures = collections.Counter()
+
+    postprocess_names_random = random.Random(hashlib.sha256(bytes(db.llm_db_name, "utf-8")).digest())
+    mode = postprocess_names_random.choice(postprocess_name_modes)
+
+    db.llm_only_db_name = db.llm_db_name
+    db.llm_db_name = postprocess_name(db.llm_db_name, mode=mode)
+
+    prev_llm_table_names = set()
+    for table in db.tables:
+        table.llm_only_table_name = table.llm_table_name
+        # create unique llm_table_name
+        name = postprocess_name(table.llm_table_name, mode=mode)
+        if name.lower() not in prev_llm_table_names:
+            table.llm_table_name = name
+        else:
+            name = postprocess_name(table.table_name, mode=mode)
+            if name.lower() not in prev_llm_table_names:
+                table.llm_table_name = name
+                failures["duplicate_llm_table_name_use_postprocessed_original_table_name"] += 1
+            else:
+                failures["duplicate_llm_table_name_use_counting_index"] += 1
+                for idx in itertools.count(start=1):
+                    name = postprocess_name(f"{table.llm_table_name}_{idx}", mode=mode)
+                    if name.lower() not in prev_llm_table_names:
+                        table.llm_table_name = name
+                        break
+        prev_llm_table_names.add(table.llm_table_name.lower())
+
+        prev_llm_col_names = set()
+        new_col_names = []
+        table.llm_only_column_names = []
+        for col, orig_col in zip(table.llm_renamed_df.columns, table.table_df.columns):
+            table.llm_only_column_names.append(col[0])
+
+            name = postprocess_name(col[0], mode=mode)
+            if name.lower() not in prev_llm_col_names:
+                new_col_names.append((name, col[1], col[2]))
+                prev_llm_col_names.add(name.lower())
+            else:
+                name = postprocess_name(orig_col[0], mode=mode)
+                if name.lower() not in prev_llm_col_names:
+                    new_col_names.append((name, col[1], col[2]))
+                    prev_llm_col_names.add(name.lower())
+                    failures["duplicate_llm_column_name_use_postprocessed_original_column_name"] += 1
+                else:
+                    failures["duplicate_llm_column_name_use_counting_index"] += 1
+                    for idx in itertools.count(start=1):
+                        name = postprocess_name(f"{col[0]}_{idx}", mode=mode)
+                        if name.lower() not in prev_llm_col_names:
+                            new_col_names.append((name, col[1], col[2]))
+                            prev_llm_col_names.add(name.lower())
+                            break
+
+        table.llm_renamed_df.columns = new_col_names
+
+    _save_database(db, db_path)
+    return failures
+
+
+@hydra.main(version_base=None, config_path="../conf", config_name="rename.yaml")
+def postprocess_names(cfg: DictConfig) -> None:
+    log.info(f"Postprocess names.")
+
+    dbs_to_rename = [x for x in sorted(Path(cfg.output_folder).iterdir()) if x.is_dir()][:cfg.limit]
+
+    args = [(cfg, db_path) for db_path in dbs_to_rename]
+
+    # handle databases
+    failures = collections.Counter()
+    for fails in pqdm(
+            args,
+            postprocess_names_for_database,
+            desc="postprocess names",
+            n_jobs=cfg.processes,
+            exception_behaviour="immediate"
+    ):
+        failures += fails
+    log.info(f"{failures}")
 
 
 if __name__ == "__main__":
-    start_renaming()
+    create_rename_start_table_request_batches()
+    rename_start_tables()
+    create_rename_connected_table_request_batches()
+    rename_connected_tables()
+    postprocess_names()

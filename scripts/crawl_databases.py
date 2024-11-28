@@ -1,10 +1,10 @@
 import json
 import logging
-import math
 import multiprocessing
 import random
 import shutil
 import time
+import gzip
 from pathlib import Path
 
 import hydra
@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 @hydra.main(version_base=None, config_path="../conf", config_name="databases.yaml")
 def start_db_creation(cfg: DictConfig):
     # create data and profiling folder if necessary
-    creation_run_path = Path(f"./data/databases/{cfg.creation_run_name}")
+    creation_run_path = Path(cfg.output_path)
     creation_run_path.mkdir(parents=True, exist_ok=True)
     shutil.copy(Path("./conf/databases.yaml"), creation_run_path)
 
@@ -48,7 +48,7 @@ def start_db_creation(cfg: DictConfig):
     log.info(f"Read profiling file in {time.time() - before:.2f} seconds.")  # 25.55s for profiling_info_final.jsonl
 
     all_lines = all_lines[:cfg.limit]
-    random.shuffle(all_lines)
+    #random.shuffle(all_lines) 
     log.info(f"Planning to crawl {len(all_lines)} databases")
 
     before = time.time()
@@ -116,7 +116,14 @@ def handle_line(
     table_name = table_name.replace("/", " ")
     db_name = utils.slugify(table_name)
     db_path = Path(creation_run_path /f"{topic_dict['idx']} {db_name}")
-    if db_path.exists():
+
+    # skip if a database at this path already exists
+    try:
+        if db_path.exists():
+            log.info("Skip, path exists")
+            return None
+    except OSError as e:
+        log.error(f"{e} when checking if DB exists")
         return None
 
     num_rows_for_table = topic_dict["num_rows"]
@@ -126,10 +133,10 @@ def handle_line(
     if cfg.max_rows and num_rows_for_table > cfg.max_rows:
         return None
 
-    log.debug("################################################################################################")
-    log.debug("########################################################################################################")
+    #log.debug("################################################################################################")
+    #log.debug("########################################################################################################")
     log.info(
-        f"Database: *{topic_dict['idx']} {topic_dict['predicate_label']} - {topic_dict['object_label']}* with {num_rows_for_table} rows")
+        f"Trying to build Database: *{topic_dict['idx']} {topic_dict['predicate_label']} - {topic_dict['object_label']}* with {num_rows_for_table} rows")
 
     # create_db_for_topic
     database = create_database_for_topic(cfg=cfg,
@@ -143,22 +150,29 @@ def handle_line(
     if database is None:
         return None
 
-    statistics["number_of_tables"].append(len(database.tables))
-    statistics["number_of_cols"].append([len(table.table_df.columns) for table in database.tables])
-    statistics["number_of_rows"].append([len(table.table_df) for table in database.tables])
-    statistics["table_names_orig"].append([table.table_name for table in database.tables])
-    statistics["column_names_orig"].append([list(str(x[0]) for x in table.columns) for table in database.tables])
+    try:
+        db_path.mkdir()
 
-    # serialize database class and tables to disk
-    with open(db_path / "database.json", "w", encoding="utf-8") as file:
-        for table in database.tables:
-            table.rows = None  # cannot serialize rows since dict keys are tuples...
-            table.full_properties_with_outgoing_items = None  # cannot serialize...
-            table.properties_with_outgoing_items = None  # cannot serialize...
-        json.dump(converter.unstructure(database), file)
+        # serialize database class and tables to disk
+        with open(db_path / "database.json.gz", "wt", encoding="utf-8") as file:
+            for table in database.tables:
+                table.rows = None  # cannot serialize rows since dict keys are tuples...
+                table.full_properties_with_outgoing_items = None  # cannot serialize...
+                table.properties_with_outgoing_items = None  # cannot serialize...
+            json.dump(converter.unstructure(database), file)
 
-    with open(db_path / "database.json", "r", encoding="utf-8") as file:
-        database_copy = converter.structure(json.load(file), Database)
+        with open(db_path / "database.json.gz", "rt", encoding="utf-8") as file:
+            database_copy = converter.structure(json.load(file), Database)
+
+        statistics["number_of_tables"].append(len(database.tables))
+        statistics["number_of_cols"].append([len(table.table_df.columns) for table in database.tables])
+        statistics["number_of_rows"].append([len(table.table_df) for table in database.tables])
+        statistics["table_names_orig"].append([table.table_name for table in database.tables])
+        statistics["column_names_orig"].append([list(str(x[0]) for x in table.columns) for table in database.tables])
+
+    except Exception as e:
+        log.error(f"{e} when trying to save DB {db_path}")
+
 
     return statistics
 

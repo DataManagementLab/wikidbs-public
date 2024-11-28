@@ -67,8 +67,7 @@ def create_schema_diagram(tables: list[wikidbs.schema.Table], save_path: Path, s
 
 
         # get foreign keys of table:
-        table_fk_columns = [x.column for x in table.foreign_keys]
-        table_fk_columns.append(columns[0])
+        table_fk_columns = [columns[0]] + [x.column for x in table.foreign_keys]
 
         num_further_columns = len(df.columns) - len(table_fk_columns)
 
@@ -77,28 +76,24 @@ def create_schema_diagram(tables: list[wikidbs.schema.Table], save_path: Path, s
         erd_df[f"{num_further_columns}_further_columns"] = [0 for x in range(len(erd_df))]
 
         # adapt names
-        erd_df.columns = [slugify(label, word_boundary=True, separator='_', allow_unicode=False, lowercase=False) for label in erd_df.columns]
+        erd_df.columns = erd_df.columns.to_list()
 
         table_name = table.table_name
-
-        table_name_slugified = "_" + slugify(table_name, word_boundary=True, separator='_', allow_unicode=False, lowercase=False)
-        
-        
-        erd_diagram.add_table(erd_df, table_name_slugified, bg_color=random.choice(bg_colors))
+        erd_diagram.add_table(erd_df, table_name, bg_color=random.choice(bg_colors))
         
     # add relations:
     for table in tables:
         table_name = table.table_name
-        table_name = "_" + slugify(table_name, word_boundary=True, separator='_', allow_unicode=False, lowercase=False)
         
         for fk in table.foreign_keys:
-            right_table_name = "_" + slugify(fk.reference_table, word_boundary=True, separator='_', allow_unicode=False, lowercase=False)
-            reference_column = slugify(fk.reference_column, word_boundary=True, separator='_', allow_unicode=False, lowercase=False)
-            left_table_name = slugify(fk.column, word_boundary=True, separator='_', allow_unicode=False, lowercase=False)
-            # right_table_name = fk.reference_table
-            #reference_column = fk.reference_column
-
-            erd_diagram.create_rel(left_table_name=table_name, right_table_name=right_table_name, left_on=left_table_name, right_on=reference_column, left_cardinality='1', right_cardinality='1')
+            erd_diagram.create_rel(
+                left_table_name=table_name,
+                right_table_name=fk.reference_table,
+                left_on=fk.column,
+                right_on=fk.reference_column,
+                left_cardinality='1',
+                right_cardinality='1'
+            )
 
     erd_diagram.write_to_file(save_path / f"schema_diagram.dot")
 

@@ -1,22 +1,32 @@
 ########################################################################################################################
-# OpenAI API helpers version: 2024-05-31
+# OpenAI API helpers version: 2024-09-29
 #
 # use the following methods:
-# openai_model(...)        ==> get information about the models
+# openai_model(...)        ==> get model info
 # openai_execute(...)      ==> execute API requests
-# openai_cost_for_cache()  ==> compute the total dollar cost incurred by all cached requests/responses
+# openai_cost_for_cache()  ==> compute total cost of all cached responses
+#
+# You must store your OpenAI API key in an environment variable, for example using:
+# export OPENAI_API_KEY="<your-key>"
+#
+# To call openai_execute(...) from multiple processes, you must use a global context:
+# with multiprocessing.Manager() as manager:
+#     context = manager.dict()
+#     semaphore = manager.Semaphore()
+#     # every call now requires the context and semaphore:
+#     responses = openai_execute(requests, global_context=context, global_semaphore=semaphore)
 ########################################################################################################################
 
 import dataclasses
-import datetime
+import functools
 import hashlib
 import json
 import logging
-import multiprocessing
 import os
 import pathlib
 import threading
 import time
+from typing import Literal, Any
 
 import requests
 import tiktoken
@@ -24,285 +34,115 @@ import tqdm
 
 logger = logging.getLogger(__name__)
 
-_completion_url = "https://api.openai.com/v1/completions"
-_chat_url = "https://api.openai.com/v1/chat/completions"
-_additional_tokens_per_message = 10
-_cost_for_failed_requests = 0.0
-_usage_for_failed_requests = 0
-_wait_window = 80.0
-_wait_before_retry = 0.1
-_wait_before_try = 0.001
-_api_share = 0.6
-_cache_path = pathlib.Path("data/openai_cache")
-_cache_size = 500_000
+CACHE_PATH = pathlib.Path("data/openai_cache")
 
-# pricing: https://openai.com/pricing
-# context: https://platform.openai.com/docs/models
-# limits: https://platform.openai.com/account/limits
-_model_parameters = {
+MODEL_PARAMETERS = {  # see https://platform.openai.com/docs/models and https://openai.com/pricing
+    # GPT-3.5 Turbo Instruct
+    "gpt-3.5-turbo-instruct-0914": {
+        "chat_or_completion": "completion",
+        "cost_per_1k_input_tokens": 0.0015,  # taken from "gpt-4"
+        "cost_per_1k_output_tokens": 0.0020,  # taken from "gpt-4"
+        "max_context": 4_096,
+        "max_output_tokens": 4_096
+    },
+
+    # GPT-3.5 Turbo
     "gpt-3.5-turbo-1106": {
         "chat_or_completion": "chat",
-        "max_rpm": 10_000,
-        "max_tpm": 2_000_000,
-        "cost_per_1k_input_tokens": 0.001,  # ?
-        "cost_per_1k_output_tokens": 0.002,  # ?
+        "cost_per_1k_input_tokens": 0.0010,
+        "cost_per_1k_output_tokens": 0.0020,
         "max_context": 16_385,
         "max_output_tokens": 4_096
     },
     "gpt-3.5-turbo-0125": {
         "chat_or_completion": "chat",
-        "max_rpm": 10_000,
-        "max_tpm": 2_000_000,
         "cost_per_1k_input_tokens": 0.0005,
         "cost_per_1k_output_tokens": 0.0015,
         "max_context": 16_385,
         "max_output_tokens": 4_096
     },
-    "gpt-3.5-turbo-instruct-0914": {
-        "chat_or_completion": "completion",
-        "max_rpm": 3_500,
-        "max_tpm": 90_000,
-        "cost_per_1k_input_tokens": 0.0015,
-        "cost_per_1k_output_tokens": 0.002,
-        "max_context": 4_096,
-        "max_output_tokens": None
+
+    # GPT-4 Turbo and GPT-4
+    "gpt-4-0314": {
+        "chat_or_completion": "chat",
+        "cost_per_1k_input_tokens": 0.0300,  # taken from "gpt-4"
+        "cost_per_1k_output_tokens": 0.0600,  # taken from "gpt-4"
+        "max_context": 8_192,
+        "max_output_tokens": 8_192
+    },
+    "gpt-4-0613": {
+        "chat_or_completion": "chat",
+        "cost_per_1k_input_tokens": 0.0300,  # taken from "gpt-4"
+        "cost_per_1k_output_tokens": 0.0600,  # taken from "gpt-4"
+        "max_context": 8_192,
+        "max_output_tokens": 8_192
     },
     "gpt-4-1106-preview": {
         "chat_or_completion": "chat",
-        "max_rpm": 10_000,
-        "max_tpm": 2_000_000,
-        "cost_per_1k_input_tokens": 0.01,
-        "cost_per_1k_output_tokens": 0.03,
+        "cost_per_1k_input_tokens": 0.0100,
+        "cost_per_1k_output_tokens": 0.0300,
         "max_context": 128_000,
         "max_output_tokens": 4_096
     },
     "gpt-4-0125-preview": {
         "chat_or_completion": "chat",
-        "max_rpm": 10_000,
-        "max_tpm": 2_000_000,
-        "cost_per_1k_input_tokens": 0.01,
-        "cost_per_1k_output_tokens": 0.03,
+        "cost_per_1k_input_tokens": 0.0100,
+        "cost_per_1k_output_tokens": 0.0300,
         "max_context": 128_000,
         "max_output_tokens": 4_096
     },
     "gpt-4-turbo-2024-04-09": {
         "chat_or_completion": "chat",
-        "max_rpm": 10_000,
-        "max_tpm": 1_500_000,
-        "cost_per_1k_input_tokens": 0.01,
-        "cost_per_1k_output_tokens": 0.03,
+        "cost_per_1k_input_tokens": 0.0100,
+        "cost_per_1k_output_tokens": 0.0300,
         "max_context": 128_000,
-        "max_output_tokens": 4_096  # ?
+        "max_output_tokens": 4_096
     },
+
+    # GPT-4o and GPT-4o mini
     "gpt-4o-2024-05-13": {
         "chat_or_completion": "chat",
-        "max_rpm": 10_000,
-        "max_tpm": 2_000_000,
-        "cost_per_1k_input_tokens": 0.005,
-        "cost_per_1k_output_tokens": 0.015,
+        "cost_per_1k_input_tokens": 0.00500,
+        "cost_per_1k_output_tokens": 0.01500,
         "max_context": 128_000,
-        "max_output_tokens": 4_096  # ?
+        "max_output_tokens": 4_096
+    },
+    "gpt-4o-2024-08-06": {
+        "chat_or_completion": "chat",
+        "cost_per_1k_input_tokens": 0.00250,
+        "cost_per_1k_output_tokens": 0.01000,
+        "max_context": 128_000,
+        "max_output_tokens": 16_384
+    },
+    "gpt-4o-mini-2024-07-18": {
+        "chat_or_completion": "chat",
+        "cost_per_1k_input_tokens": 0.000150,
+        "cost_per_1k_output_tokens": 0.000600,
+        "max_context": 128_000,
+        "max_output_tokens": 16_384
+    },
+
+    # o1 preview and o1 mini
+    "o1-preview-2024-09-12": {
+        "chat_or_completion": "chat",
+        "cost_per_1k_input_tokens": 0.015,
+        "cost_per_1k_output_tokens": 0.060,
+        "max_context": 128_000,
+        "max_output_tokens": 32_768
+    },
+    "o1-mini-2024-09-12": {
+        "chat_or_completion": "chat",
+        "cost_per_1k_input_tokens": 0.003,
+        "cost_per_1k_output_tokens": 0.012,
+        "max_context": 128_000,
+        "max_output_tokens": 65_536
     }
 }
 
 
-def _get_model_params(model: str) -> dict:
-    if model not in _model_parameters.keys():
-        raise AssertionError(f"Unknown model '{model}'!")
-    else:
-        return _model_parameters[model]
-
-
-class _Request:
-    request: dict
-
-    def __init__(self, request: dict) -> None:
-        self.request = request
-
-    @property
-    def model(self) -> str:
-        if "model" not in self.request.keys():
-            raise AttributeError("The request is missing the required field `model`!")
-        return self.request["model"]
-
-    @property
-    def messages(self) -> list[dict]:
-        if "messages" not in self.request.keys():
-            raise AttributeError("The request is missing the field `messages`, which is required for this model!")
-        return self.request["messages"]
-
-    @property
-    def prompt(self) -> str:
-        if "prompt" not in self.request.keys():
-            raise AttributeError("The request is missing the field `prompt`, which is required for this model!")
-        return self.request["prompt"]
-
-    def is_chat_or_completion(self) -> str:
-        return _get_model_params(self.model)[
-            "chat_or_completion"]  # use `model` to determine if request is for chat or completion
-
-    def estimate_input_tokens(self) -> int:
-        encoding = tiktoken.encoding_for_model(self.model)
-
-        if self.is_chat_or_completion() == "chat":
-            extra_tokens = _additional_tokens_per_message
-            return sum(len(encoding.encode(message["content"])) + extra_tokens for message in self.messages)
-        elif self.is_chat_or_completion() == "completion":
-            return len(encoding.encode(self.prompt))
-        else:
-            raise AssertionError(f"Invalid parameter `chat_or_completion` for model '{self.model}'!")
-
-    def estimate_max_output_tokens(self) -> int:
-        if "max_tokens" in self.request.keys() and self.request["max_tokens"] is not None:
-            return self.request["max_tokens"]
-        else:
-            model_params = _get_model_params(self.model)
-            left_for_output = max(0, model_params["max_context"] - self.estimate_input_tokens())
-            if model_params["max_output_tokens"] is not None and model_params["max_output_tokens"] < left_for_output:
-                return model_params["max_output_tokens"]
-            else:
-                return left_for_output
-
-    def estimate_max_total_tokens(self) -> int:
-        return self.estimate_input_tokens() + self.estimate_max_output_tokens()
-
-    def estimate_input_usage(self) -> int:
-        if "best_of" in self.request.keys():
-            n = self.request["best_of"]
-        elif "n" in self.request.keys():
-            n = self.request["n"]
-        else:
-            n = 1
-        return n * self.estimate_input_tokens()
-
-    def estimate_max_output_usage(self) -> int:
-        if "best_of" in self.request.keys():
-            n = self.request["best_of"]
-        elif "n" in self.request.keys():
-            n = self.request["n"]
-        else:
-            n = 1
-        return n * self.estimate_max_output_tokens()
-
-    def estimate_max_total_usage(self) -> int:
-        return self.estimate_input_usage() + self.estimate_max_output_usage()
-
-    def estimate_max_cost(self) -> float:
-        model_params = _get_model_params(self.model)
-
-        input_cost = self.estimate_input_usage() * (model_params["cost_per_1k_input_tokens"] / 1000)
-        output_cost = self.estimate_max_output_usage() * (model_params["cost_per_1k_output_tokens"] / 1000)
-        return input_cost + output_cost
-
-    def check(self) -> None:
-        model_params = _get_model_params(self.model)
-        estimated_input_tokens = self.estimate_input_tokens()
-        if model_params["max_context"] < estimated_input_tokens:
-            logger.warning("Unable to process the input tokens due to the model's `max_context` parameter!")
-
-        if model_params["max_context"] == estimated_input_tokens:
-            logger.warning("Unable to generate any output tokens due to the model's `max_context` parameter!")
-
-        if "max_tokens" in self.request.keys() and self.request["max_tokens"] is not None:
-            if model_params["max_output_tokens"] is not None and model_params["max_output_tokens"] < self.request[
-                "max_tokens"]:
-                logger.warning(
-                    "Unable to generate `max_tokens` output tokens due to the model's `max_output_tokens` parameter!")
-
-            if model_params["max_context"] < estimated_input_tokens + self.request["max_tokens"]:
-                logger.warning(
-                    "Unable to generate `max_tokens` output tokens due to the model's `max_context` parameter!")
-
-        if "seed" not in self.request.keys():
-            logger.warning("The request is missing the optional field `seed`, which is required for reproducibility!")
-
-        if "temperature" not in self.request.keys() or self.request["temperature"] != 0:
-            logger.warning("The request's field `temperature` is not set to 0, which is required for reproducibility!")
-
-    def compute_hash(self) -> str:
-        return hashlib.sha256(bytes(json.dumps(self.request), "utf-8")).hexdigest()
-
-    def load_cached_response(self):  # -> Response | None
-        matching_file_paths = list(sorted(_cache_path.glob(f"*-{self.compute_hash()}.json")))
-        if len(matching_file_paths) > 0:
-            matching_file_path = matching_file_paths[0]
-            with open(matching_file_path, "r", encoding="utf-8") as file:
-                cached_pair = json.load(file)
-                cached_request = _Request(cached_pair["request"])
-                cached_response = _Response(cached_pair["response"])
-                if self.request == cached_request.request:
-                    return cached_response
-        return None
-
-    def execute(self) -> tuple["_Response", bool]:
-        response = self.load_cached_response()
-        if response is not None:
-            return response, True
-
-        if self.is_chat_or_completion() == "chat":
-            url = _chat_url
-        elif self.is_chat_or_completion() == "completion":
-            url = _completion_url
-        else:
-            raise AssertionError(f"Invalid parameter `chat_or_completion` for model '{self.model}'!")
-
-        http_response = requests.post(
-            url=url,
-            json=self.request,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"}
-        )
-        response = _Response(http_response.json())
-
-        if http_response.status_code != 200:
-            logger.warning(f"Request failed: {http_response.content}")
-        else:
-            request_hash = self.compute_hash()
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
-            cache_file_path = _cache_path / f"{timestamp}-{request_hash}.json"
-            with open(cache_file_path, "w", encoding="utf-8") as cache_file:
-                json.dump({"request": self.request, "response": response.response}, cache_file)
-
-        return response, False
-
-
-class _Response:
-    response: dict
-
-    def __init__(self, response: dict) -> None:
-        self.response = response
-
-    @property
-    def model(self) -> str:
-        if "model" not in self.response.keys():
-            raise AttributeError("The response is missing the field `model` which is required for successful requests!")
-        return self.response["model"]
-
-    @property
-    def usage(self) -> dict:
-        if "usage" not in self.response.keys():
-            raise AttributeError("The response is missing the field `usage` which is required for successful requests!")
-        return self.response["usage"]
-
-    def was_successful(self) -> bool:
-        return "choices" in self.response.keys()  # use entry `choices` to determine if request was successful
-
-    def compute_total_usage(self) -> int:
-        if self.was_successful():
-            return self.usage["total_tokens"]
-        else:
-            return _usage_for_failed_requests
-
-    def compute_total_cost(self) -> float:
-        if self.was_successful():
-            model_params = _get_model_params(self.model)
-            total_cost = 0
-            if "prompt_tokens" in self.usage.keys():
-                total_cost += self.usage["prompt_tokens"] * (model_params["cost_per_1k_input_tokens"] / 1000)
-            if "completion_tokens" in self.usage.keys():
-                total_cost += self.usage["completion_tokens"] * (model_params["cost_per_1k_output_tokens"] / 1000)
-            return total_cost
-        else:
-            return _cost_for_failed_requests
+########################################################################################################################
+# API
+########################################################################################################################
 
 
 def openai_model(
@@ -319,23 +159,13 @@ def openai_model(
     return _get_model_params(model)
 
 
-@dataclasses.dataclass
-class _Pair:
-    request: _Request
-    response: _Response | None = None
-    was_cached: bool = False
-    usage: int | None = None
-    finished_time: float | None = None
-    thread: threading.Thread | None = None
-
-
 def openai_execute(
         requests: list[dict],
-        history_semaphore: multiprocessing.Semaphore,
-        history: dict,
         *,
         force: float | None = None,
-        silent: bool = False
+        silent: bool = False,
+        global_context: dict | None = None,
+        global_semaphore: "multiprocessing.Semaphore | None" = None
 ) -> list[dict]:
     """Execute a list of requests against the OpenAI API.
 
@@ -344,114 +174,206 @@ def openai_execute(
 
     Args:
         requests: A list of API requests.
-        force: An optional float specifying the cost below which no confirmation should be required.
+        force: An optional float specifying the cost below or equal to which no confirmation should be required.
         silent: Whether to display log messages and progress bars.
+        global_context: Optional global context for use with multiprocessing.
+        global_semaphore: Optional global semaphore for use with multiprocessing.
 
     Returns:
         A list of API responses.
     """
+    global _local_context, _local_semaphore
+
+    if (global_context is None) != (global_semaphore is None):
+        raise AssertionError("You must provide either both `global_context` and `global_semaphore` or neither!")
+
+    if global_context is not None:
+        context = global_context
+        semaphore = global_semaphore
+    else:
+        context = _local_context
+        semaphore = _local_semaphore
+
+    with semaphore:
+        if "num_running" not in context.keys():
+            context["num_running"] = 0
+
     pairs = [_Pair(_Request(request)) for request in requests]
 
-    # check requests
-    for pair in pairs:
-        pair.request.check()
+    with _ProgressBar(total=len(pairs), desc="", disable=silent) as progress_bar:
 
-    # create cache directory
-    os.makedirs(_cache_path, exist_ok=True)
+        # check requests
+        progress_bar.set_description("check requests")
+        progress_bar.reset(total=len(pairs))
+        for pair in pairs:
+            pair.request.check()
+            progress_bar.update()
 
-    # load cached pairs
-    for pair in pairs:
-        pair.response = pair.request.load_cached_response()
-        if pair.response is not None:
-            pair.was_cached = True
+        # create cache directory
+        CACHE_PATH.mkdir(parents=True, exist_ok=True)
 
-    pairs_to_execute = [pair for pair in pairs if not pair.was_cached]
+        # load cached pairs
+        pairs_to_execute = []
+        progress_bar.set_description("load responses")
+        progress_bar.reset(total=len(pairs))
+        for pair in pairs:
+            pair.response = pair.request.load_cached_response()
+            if pair.response is None:
+                pairs_to_execute.append(pair)
+            else:
+                progress_bar.cached += 1
+            progress_bar.update()
 
-    # compute maximum cost
-    total_max_cost = sum(pair.request.estimate_max_cost() for pair in pairs_to_execute)
-    if force is None or total_max_cost >= force:
-        logger.info(f"Press enter to continue and spend up to around ${total_max_cost:.4f}.")
-        input(f"Press enter to continue and spend up to around ${total_max_cost:.4f}.")
-        if not silent:
-            logger.info("Begin execution.")
-    elif not silent:
-        logger.info(f"Spending up to around ${total_max_cost:.4f}.")
+        # in case some pairs were not cached, execute them
+        if len(pairs_to_execute) > 0:
+            progress_bar.clear()  # clear before printing/logging
 
-    # sort to execute longest requests first
-    for pair in pairs_to_execute:
-        pair.usage = pair.request.estimate_max_total_usage()
-    pairs_to_execute.sort(key=lambda p: p.usage, reverse=True)
+            if "OPENAI_API_KEY" not in os.environ.keys():
+                raise AssertionError(f"Missing `OPENAI_API_KEY` in environment variables!")
 
-    # execute requests
-    with tqdm.tqdm(total=len(pairs), desc="execute requests", disable=silent) as progress_bar:
-        for pair in pairs_to_execute:
-            model_params = _get_model_params(pair.request.model)
+            # compute maximum cost
+            total_max_cost = sum(pair.request.max_cost() for pair in pairs_to_execute)
+            if force is None or total_max_cost > force:
+                logger.info(f"press enter to continue and spend up to around ${total_max_cost:.2f}")
+                input(f"press enter to continue and spend up to around ${total_max_cost:.2f}")
+            elif not silent and total_max_cost > 0:
+                logger.info(f"spending up to around ${total_max_cost:.2f}")
 
-            while True:
-                history_semaphore.acquire()
-                if history["last_update"] is None:
-                    history["rpm_budget"] = model_params["max_rpm"]
-                    history["tpm_budget"] = model_params["max_tpm"]
-                    history["last_update"] = time.time()
-                else:
-                    now = time.time()
-                    delta = now - history["last_update"]
-                    history["last_update"] = now
-                    history["rpm_budget"] = min(model_params["max_rpm"], history["rpm_budget"] + model_params["max_rpm"] * delta / 60)
-                    history["tpm_budget"] = min(model_params["max_tpm"], history["tpm_budget"] + model_params["max_tpm"] * delta / 60)
+            # sort requests to execute longest requests first, put one short request first to quickly obtain HTTP header
+            pairs_to_execute.sort(key=lambda p: p.request.max_total_usage(), reverse=True)
+            pairs_to_execute = pairs_to_execute[-1:] + pairs_to_execute[:-1]
 
-                if history["rpm_budget"] * _api_share < 1:
-                    logger.info(f"Sleep to abide the model's `max_rpm` parameter. {history}")
-                    sleep, do = _wait_before_retry, False
-                elif history["tpm_budget"] * _api_share < pair.usage:
-                    logger.info(f"Sleep to abide the model's `max_tpm` parameter. {history}")
-                    sleep, do = _wait_before_retry, False
-                else:
-                    sleep, do = _wait_before_try, True
-                    history["rpm_budget"] -= 1
-                    history["tpm_budget"] -= pair.usage
-                history_semaphore.release()
+            # execute requests
+            progress_bar.set_description("execute requests")
+            progress_bar.reset(total=len(pairs))
+            progress_bar.update(progress_bar.cached)
+            while True:  # break if all(pair.status == "done" for pair in pairs_to_execute)
+                logger.debug("repeatedly iterate through pairs until all are done")
+                for pair in pairs_to_execute:
+                    with semaphore:
+                        if pair.status != "open":
+                            continue
+                        pair.status = "waiting"
 
-                time.sleep(sleep)
-                if do:
-                    def execute(p, pb, hist, sem):
-                        p.response, p.was_cached = p.request.execute()
-                        p.finished_time = time.time()
-                        new_usage = p.response.compute_total_usage()
-                        usage_delta = p.usage - new_usage
-                        p.usage = new_usage
-                        pb.update()
-                        sem.acquire()
-                        history["tpm_budget"] = min(model_params["max_tpm"], history["tpm_budget"] + usage_delta)
-                        sem.release()
+                        if pair.request.model not in context.keys():
+                            context[pair.request.model] = _ModelBudgetState.new()
 
-                    pair.thread = threading.Thread(target=execute, args=(pair, progress_bar, history, history_semaphore))
-                    pair.thread.start()
+                    while True:  # break if request is "done" in sequential execution or "running" in parallel execution
+                        with semaphore:
+                            context[pair.request.model] = context[pair.request.model].consider_time()
+
+                            if context[pair.request.model].is_enough_for_request(pair.request):
+                                match context[pair.request.model].mode:
+                                    case "sequential" if context["num_running"] == 0:
+                                        logger.debug(f"sequential execution for `{pair.request.model}`: execute")
+                                        progress_bar.bottleneck = "P"
+
+                                        pair.status = "running"
+                                        context["num_running"] = context["num_running"] + 1
+                                        progress_bar.running = context["num_running"]
+                                        progress_bar.update_postfix()
+
+                                        context[pair.request.model] = context[pair.request.model].decrease_by_request(
+                                            pair.request
+                                        )
+
+                                        http_response = pair.request.execute()
+                                        pair.response = _Response(http_response.json())
+
+                                        context[pair.request.model] = context[pair.request.model].set_from_headers(
+                                            http_response.headers
+                                        )
+
+                                        context["num_running"] = context["num_running"] - 1
+                                        progress_bar.running = context["num_running"]
+                                        progress_bar.cost += pair.response.total_cost()
+
+                                        match http_response.status_code:
+                                            case 200:
+                                                context[pair.request.model] = context[pair.request.model].to_parallel()
+                                                pair.status = "done"
+                                                progress_bar.update()
+                                                break
+                                            case 429:
+                                                pair.status = "open"
+                                                progress_bar.update_postfix()  # not done -> update only postfix
+                                            case _:
+                                                pair.status = "done"
+                                                progress_bar.failed += 1
+                                                progress_bar.update()
+                                                break
+                                    case "parallel" if context["num_running"] < 200:  # max. num. of parallel requests
+                                        logger.debug(f"parallel execution for `{pair.request.model}`: execute")
+                                        progress_bar.bottleneck = "P"
+
+                                        pair.status = "running"
+                                        context["num_running"] = context["num_running"] + 1
+                                        progress_bar.running = context["num_running"]
+                                        progress_bar.update_postfix()
+
+                                        context[pair.request.model] = context[pair.request.model].decrease_by_request(
+                                            pair.request
+                                        )
+
+                                        def execute(p: _Pair, pb: _ProgressBar, c: dict,
+                                                    s: threading.Semaphore) -> None:
+                                            http_response = p.request.execute()
+                                            p.response = _Response(http_response.json())
+
+                                            with s:
+                                                c[pair.request.model] = c[p.request.model].set_from_headers(
+                                                    http_response.headers
+                                                )
+
+                                                c["num_running"] = c["num_running"] - 1
+                                                pb.running = c["num_running"]
+                                                pb.cost += p.response.total_cost()
+
+                                                match http_response.status_code:
+                                                    case 200:
+                                                        c[p.request.model] = c[p.request.model].increase_by_response(
+                                                            p.request,
+                                                            p.response
+                                                        )
+                                                        p.status = "done"
+                                                        pb.update()
+                                                    case 429:
+                                                        logger.debug(
+                                                            f"parallel execution for `{p.request.model}`: "
+                                                            f"rate limit error -> switch to sequential execution"
+                                                        )
+                                                        p.status = "open"
+                                                        c[p.request.model] = c[p.request.model].to_sequential()
+                                                        pb.update_postfix()  # not done -> update only postfix
+                                                    case _:
+                                                        p.status = "done"
+                                                        pb.failed += 1
+                                                        pb.update()
+
+                                        pair.thread = threading.Thread(
+                                            target=execute,
+                                            args=(pair, progress_bar, context, semaphore)
+                                        )
+                                        pair.thread.start()
+                                        break
+                                    case _:
+                                        progress_bar.bottleneck = "T"
+                                        progress_bar.update_postfix()
+                            else:
+                                progress_bar.bottleneck = "L"
+                                progress_bar.update_postfix()
+
+                        time.sleep(0.05)  # sleep to wait for thread limit or rate limit budget
+
+                if all(pair.status == "done" for pair in pairs_to_execute):
                     break
+                progress_bar.bottleneck = "S"
+                progress_bar.update_postfix()
+                time.sleep(1)  # sleep to wait for stragglers and failures
 
-        for pair in pairs_to_execute:
-            if pair.thread is not None:
-                pair.thread.join()
-
-    # shrink cache
-    cache_file_paths = list(sorted(_cache_path.glob("*.json")))
-    if len(cache_file_paths) > _cache_size:
-        logger.warning(f"OpenAI cache is too large ({len(cache_file_paths)} > {_cache_size}) and will be shrunk!")
-        for cache_file_path in cache_file_paths[:-_cache_size]:
-            os.remove(cache_file_path)
-
-    # describe output
-    num_failed_requests = sum(not pair.response.was_successful() for pair in pairs)
-    if num_failed_requests > 0:
-        logger.warning(f"{num_failed_requests} requests failed!")
-
-    total_cost = sum(pair.response.compute_total_cost() for pair in pairs_to_execute if not pair.was_cached)
-    if True or not silent:  # MODIFIED
-        message = f"Spent ${total_cost:.4f}."
-        was_cached = sum(pair.was_cached for pair in pairs)
-        if was_cached > 0:
-            message += f" ({was_cached} responses were already cached)"
-        logger.info(message)
+            for pair in pairs_to_execute:
+                if pair.thread is not None:
+                    pair.thread.join()
 
     return [pair.response.response for pair in pairs]
 
@@ -462,12 +384,344 @@ def openai_cost_for_cache() -> float:
     Returns:
         The total dollar cost incurred by executing all cached requests/responses.
     """
-    file_paths = list(sorted(_cache_path.glob(f"*.json")))
+    file_paths = list(sorted(CACHE_PATH.glob(f"*.json")))
     total_cost = 0
     for file_path in file_paths:
         with open(file_path, "r", encoding="utf-8") as file:
             cached_pair = json.load(file)
             cached_response = _Response(cached_pair["response"])
-            total_cost += cached_response.compute_total_cost()
+            total_cost += cached_response.total_cost()
 
     return total_cost
+
+
+########################################################################################################################
+# implementation
+########################################################################################################################
+
+
+_local_context = {}
+_local_semaphore = threading.Semaphore()
+
+
+@functools.cache
+def _get_model_params(model: str) -> dict:
+    if model not in MODEL_PARAMETERS.keys():
+        raise AssertionError(f"Unknown model `{model}`!")
+    else:
+        return MODEL_PARAMETERS[model]
+
+
+@functools.cache
+def _get_encoding_cached(model: str) -> tiktoken.Encoding:
+    return tiktoken.encoding_for_model(model)
+
+
+class _Request:
+    request: dict
+
+    def __init__(self, request: dict) -> None:
+        self.request = request
+
+    @functools.cached_property
+    def model(self) -> str:
+        if "model" not in self.request.keys():
+            raise AttributeError("Missing field `model` in request!")
+        return self.request["model"]
+
+    @functools.cached_property
+    def messages(self) -> list[dict]:
+        if "messages" not in self.request.keys():
+            raise AttributeError("Missing field `messages` in request, which is required for this model!")
+        return self.request["messages"]
+
+    @functools.cached_property
+    def prompt(self) -> str:
+        if "prompt" not in self.request.keys():
+            raise AttributeError("Missing field `prompt` in request, which is required for this model!")
+        return self.request["prompt"]
+
+    @functools.cache
+    def is_chat_or_completion(self) -> str:  # use `model` to determine if request is for chat or completion
+        return _get_model_params(self.model)["chat_or_completion"]
+
+    @functools.cache
+    def url(self) -> str:
+        match self.is_chat_or_completion():
+            case "chat":
+                return "https://api.openai.com/v1/chat/completions"
+            case "completion":
+                return "https://api.openai.com/v1/completions"
+            case _:
+                raise AssertionError(f"Invalid parameter `chat_or_completion` for model `{self.model}`!")
+
+    @functools.cache
+    def num_input_tokens(self) -> int:
+        encoding = _get_encoding_cached(self.model)
+
+        match self.is_chat_or_completion():
+            case "chat":
+                extra_tokens = 5  # number of additional tokens in each message
+                return sum(len(encoding.encode(message["content"])) + extra_tokens for message in self.messages)
+            case "completion":
+                return len(encoding.encode(self.prompt))
+            case _:
+                raise AssertionError(f"Invalid parameter `chat_or_completion` for model `{self.model}`!")
+
+    @functools.cache
+    def max_num_output_tokens(self) -> int:
+        if "max_completion_tokens" in self.request.keys() and self.request["max_completion_tokens"] is not None:
+            return self.request["max_completion_tokens"]
+        elif "max_tokens" in self.request.keys() and self.request["max_tokens"] is not None:
+            return self.request["max_tokens"]
+        else:
+            model_params = _get_model_params(self.model)
+            left_for_output = max(0, model_params["max_context"] - self.num_input_tokens())
+            if model_params["max_output_tokens"] is not None and model_params["max_output_tokens"] < left_for_output:
+                return model_params["max_output_tokens"]
+            else:
+                return left_for_output
+
+    @functools.cache
+    def max_total_tokens(self) -> int:
+        return self.num_input_tokens() + self.max_num_output_tokens()
+
+    @functools.cache
+    def max_input_usage(self) -> int:
+        if "best_of" in self.request.keys():
+            n = self.request["best_of"]
+        elif "n" in self.request.keys():
+            n = self.request["n"]
+        else:
+            n = 1
+        return n * self.num_input_tokens()
+
+    @functools.cache
+    def max_output_usage(self) -> int:
+        if "best_of" in self.request.keys():
+            n = self.request["best_of"]
+        elif "n" in self.request.keys():
+            n = self.request["n"]
+        else:
+            n = 1
+        return n * self.max_num_output_tokens()
+
+    @functools.cache
+    def max_total_usage(self) -> int:
+        return self.max_input_usage() + self.max_output_usage()
+
+    @functools.cache
+    def max_cost(self) -> float:
+        model_params = _get_model_params(self.model)
+        input_cost = self.max_input_usage() * (model_params["cost_per_1k_input_tokens"] / 1000)
+        output_cost = self.max_output_usage() * (model_params["cost_per_1k_output_tokens"] / 1000)
+        return input_cost + output_cost
+
+    @functools.cache
+    def hash(self) -> str:
+        return hashlib.sha256(bytes(json.dumps(self.request), "utf-8")).hexdigest()
+
+    def check(self) -> None:
+        model_params = _get_model_params(self.model)
+
+        if self.num_input_tokens() > model_params["max_context"]:
+            logger.warning("request's number of input tokens exceeds model's `max_context`")
+
+        if "max_tokens" in self.request.keys() and "max_completion_tokens" in self.request.keys():
+            logger.warning("request contains `max_tokens` and `max_completion_tokens`")
+
+        if "max_completion_tokens" in self.request.keys():
+            token_limit = "max_tokens"
+        elif "max_completion_tokens" in self.request.keys():
+            token_limit = "max_completion_tokens"
+        else:
+            token_limit = None
+
+        if token_limit is not None:
+            if model_params["max_output_tokens"] is not None and token_limit > model_params["max_output_tokens"]:
+                logger.warning("request's `max_tokens` or `max_completion_tokens` exceeds model's `max_output_tokens`")
+
+            if self.num_input_tokens() + token_limit > model_params["max_context"]:
+                logger.warning(
+                    "request's input tokens + `max_tokens` or `max_completion_tokens` exceeds model's `max_context`")
+
+        if "seed" not in self.request.keys():
+            logger.warning("missing optional field `seed`, which is required for reproducibility")
+
+        if "temperature" not in self.request.keys() or self.request["temperature"] != 0:
+            logger.warning("request's `temperature` not set to 0, which is required for reproducibility")
+
+    def load_cached_response(self):  # -> "_Response" | None
+        path = CACHE_PATH / f"{self.hash()}.json"
+        if path.is_file():
+            with open(path, "r", encoding="utf-8") as file:
+                cached_pair = json.load(file)
+            cached_request = _Request(cached_pair["request"])
+            cached_response = _Response(cached_pair["response"])
+            if self.request == cached_request.request:
+                return cached_response
+        return None
+
+    def execute(self) -> requests.Response:
+        http_response = requests.post(
+            url=self.url(),
+            json=self.request,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"}
+        )
+
+        if http_response.status_code == 200:
+            path = CACHE_PATH / f"{self.hash()}.json"
+            with open(path, "w", encoding="utf-8") as cache_file:
+                json.dump({"request": self.request, "response": http_response.json()}, cache_file)
+        elif http_response.status_code == 429:
+            logger.info("retry request due to rate limit error")
+        else:
+            logger.warning(f"request failed, no retry: {http_response.content}")
+
+        return http_response
+
+
+class _Response:
+    response: dict
+
+    def __init__(self, response: dict) -> None:
+        self.response = response
+
+    @functools.cache
+    def was_successful(self) -> bool:  # use entry `choices` to determine if request was successful
+        return "choices" in self.response.keys()
+
+    @functools.cached_property
+    def model(self) -> str:
+        if "model" not in self.response.keys():
+            raise AttributeError("Missing field `model` in response, which is required for successful requests!")
+        return self.response["model"]
+
+    @functools.cached_property
+    def usage(self) -> dict:
+        if "usage" not in self.response.keys():
+            raise AttributeError("Missing field `usage` in response, which is required for successful requests!")
+        return self.response["usage"]
+
+    @functools.cache
+    def total_usage(self) -> int:
+        if self.was_successful():
+            return self.usage["total_tokens"]
+        else:
+            return 0
+
+    @functools.cache
+    def total_cost(self) -> float:
+        if self.was_successful():
+            model_params = _get_model_params(self.model)
+            total_cost = 0
+            if "prompt_tokens" in self.usage.keys():
+                total_cost += self.usage["prompt_tokens"] * (model_params["cost_per_1k_input_tokens"] / 1000)
+            if "completion_tokens" in self.usage.keys():
+                total_cost += self.usage["completion_tokens"] * (model_params["cost_per_1k_output_tokens"] / 1000)
+            return total_cost
+        else:
+            return 0
+
+
+@dataclasses.dataclass
+class _Pair:
+    request: _Request
+    response: _Response | None = None
+    status: Literal["open"] | Literal["waiting"] | Literal["running"] | Literal["done"] = "open"
+    thread: threading.Thread | None = None
+
+
+@dataclasses.dataclass
+class _ModelBudgetState:
+    mode: Literal["sequential"] | Literal["parallel"]
+    rpm: int | None
+    tpm: int | None
+    r: int | None
+    t: int | None
+    last_update: float
+
+    @classmethod
+    def new(cls) -> "_ModelBudgetState":
+        return cls("sequential", None, None, None, None, time.time())
+
+    def is_enough_for_request(self, request: _Request) -> bool:
+        return (self.r is None or self.r >= 1) and (self.t is None or self.t >= request.max_total_usage())
+
+    def consider_time(self) -> "_ModelBudgetState":
+        now = time.time()
+        delta = now - self.last_update
+        if self.rpm is not None and self.r is not None:
+            self.r = min(self.rpm, int(self.r + self.rpm * delta / 60))
+        if self.tpm is not None and self.t is not None:
+            self.t = min(self.tpm, int(self.t + self.tpm * delta / 60))
+        self.last_update = now
+        return self
+
+    def decrease_by_request(self, request: _Request) -> "_ModelBudgetState":
+        if self.r is not None:
+            self.r -= 1
+        if self.t is not None:
+            self.t -= request.max_total_usage()
+        return self
+
+    def increase_by_response(self, request: _Request, response: _Response) -> "_ModelBudgetState":
+        if response.total_usage() < request.max_total_usage():
+            self.t = min(self.tpm, int(self.t + request.max_total_usage() - response.total_usage()))
+        return self
+
+    def set_from_headers(self, headers: dict[str, Any]) -> "_ModelBudgetState":
+        if "x-ratelimit-limit-requests" in headers.keys():
+            self.rpm = int(headers["x-ratelimit-limit-requests"])
+        if "x-ratelimit-limit-tokens" in headers.keys():
+            self.tpm = int(headers["x-ratelimit-limit-tokens"])
+        if "x-ratelimit-remaining-requests" in headers.keys():
+            header_r = int(headers["x-ratelimit-remaining-requests"])
+            if self.r is None or self.r > header_r:
+                self.r = header_r
+        if "x-ratelimit-remaining-tokens" in headers.keys():
+            header_t = int(headers["x-ratelimit-remaining-tokens"])
+            if self.t is None or self.t > header_t:
+                self.t = header_t
+        return self
+
+    def to_parallel(self) -> "_ModelBudgetState":
+        self.mode = "parallel"
+        return self
+
+    def to_sequential(self) -> "_ModelBudgetState":
+        self.mode = "sequential"
+        return self
+
+
+class _ProgressBar(tqdm.tqdm):
+    running: int
+    failed: int
+    cached: int
+    cost: float
+    bottleneck: Literal["T"] | Literal["L"] | Literal["P"] | Literal["S"]
+    bottleneck_counter: int
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.running = 0
+        self.failed = 0
+        self.cached = 0
+        self.cost = 0
+        self.bottleneck = "P"
+        self.update_postfix()
+
+    def __enter__(self):
+        return super().__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return super().__exit__(exc_type, exc_value, traceback)
+
+    def update(self, *args, **kwargs) -> None:
+        self.update_postfix()
+        super().update(*args, **kwargs)
+
+    def update_postfix(self) -> None:
+        self.set_postfix_str(
+            f"{self.bottleneck}{self.running:03d}, failed={self.failed}, cached={self.cached}, cost=${self.cost:.2f}"
+        )

@@ -44,6 +44,8 @@ class Table:
     llm_renamed_df: pd.DataFrame | None
     table_df: pd.DataFrame | None
     possible_relations: list[OutgoingRelation] | None
+    llm_only_table_name: str | None = None
+    llm_only_column_names: list[str] | None = None
 
     @classmethod
     def create(cls,

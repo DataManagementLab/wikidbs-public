@@ -1,6 +1,6 @@
 # WikiDBs: A large-scale corpus of relational databases from wikidata 
 
-This repository contains code to create relational databases based on Wikidata (https://www.wikidata.org/).
+This repository contains the code for WikiDBs (https://wikidbs.github.io/), a corpus of relational databases based on Wikidata (https://www.wikidata.org/).
 
 # Setup
 
@@ -98,29 +98,23 @@ This will take max. 40h, depending on the settings for 'label_names_min_num_rows
 
 # Create Databases
 
-Adapt the settings in 'conf/databases.yaml' to your needs.
+Adapt the settings in our config files, especially 'conf/databases.yaml' to your needs.
 
-We provide a script to run the full pipeline to create database per database, and we provide performance optimized scripts for the stages of crawling, renaming and postprocessing individually. On average around 5MB of disk space are necessary for each created database.
+We provide performance optimized scripts for the stages of crawling, renaming and postprocessing individually. On average around 5MB of disk space are necessary for each created database.
 
 Our scripts are scalable and the number of workers for creating databases in parallel can be specified in our configuration file.
 On an Intel(R) Xeon(R) Gold 5120 CPU @ 2.20GHz we observe the following resource consumption:
 1 CPU core per worker and ~25GiB RAM per worker.
 Each worker creates approximately 20 databases per hour on our system.
 
-To run the full pipeline: 
-
-```
-python ./scripts/create_databases_full_pipeline.py
-```
-
-To run the individual steps:
+To run the pipeline:
 
 1. The crawling will create databases from the Wikidata MongoDB dump 
 ```
 python ./scripts/crawl_databases.py
 ```
 
-2. The renaming will paraphrase table and column names using GPT-4 (adapt conf/rename.yaml)
+2. The renaming will paraphrase table and column names using the OpenAI API with batch processing (adapt conf/rename.yaml)
 ```
 python ./scripts/rename_databases.py
 ```
@@ -128,4 +122,9 @@ python ./scripts/rename_databases.py
 3. The postprocessing will transform each database into the final output format (adapt conf/postprocess.yaml)
 ```
 python ./scripts/postprocess.py
+```
+
+4. The finalize script will bring the databases in the exact for format used for the WikiDBs corpus, with the option to split them into multiple subfiles (adapt settings in scripts/finalize.py)
+```
+python ./scripts/finalize.py
 ```

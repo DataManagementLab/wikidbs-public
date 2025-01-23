@@ -49,7 +49,7 @@ We provide two options, the first one (3a) is to import our pre-processed MongoD
 
 ### 3a: Load our pre-processed Wikidata MongoDB export
 
-1. Copy the wikidata_mongodb_archive.gz (~ 13.2GB) file from our downloads to the mongo-data folder that you created in step 1.4. Around 40GB of disk space are required for the mongo-data folder. 
+1. Copy the wikidata_mongodb_archive.gz (~ 13.2GB) file from our [downloads](https://drive.google.com/drive/folders/1wMRFro0ydQghmYeavBaBv_IUsPobT_JK?usp=sharing) to the mongo-data folder that you created in step 1.4. Around 40GB of disk space are required for the mongo-data folder. 
 
 2. Log into the MongoDB Shell by executing:
 
@@ -109,6 +109,8 @@ Our scripts are scalable and the number of workers for creating databases in par
 On an Intel(R) Xeon(R) Gold 5120 CPU @ 2.20GHz we observe the following resource consumption:
 1 CPU core per worker and ~25GiB RAM per worker.
 Each worker creates approximately 20 databases per hour on our system.
+
+You'll need the "wikidata_labels.json" and the "wikidata_properties.json" files found in our [downloads](https://drive.google.com/drive/folders/1wMRFro0ydQghmYeavBaBv_IUsPobT_JK?usp=sharing).
 
 To run the pipeline:
 
